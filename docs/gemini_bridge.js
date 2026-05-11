@@ -3,14 +3,9 @@
  * ══════════════════════════════════════════════════════════════════════════════
  * DeepDive — LLM bridge module.
  *
- * KEY MODE (Option B — Cloudflare Worker proxy)
- * ──────────────────────────────────────────────
- * The API key is stored as a secret in a Cloudflare Worker environment variable.
- * The browser never sees the key — it sends requests to the Worker URL below,
- * and the Worker forwards them to Groq with the key attached server-side.
- *
- * To update the key: go to the Worker dashboard → Settings → Variables & Secrets.
- * To change the Worker URL: update PROXY_URL below.
+ * KEY MODE: Cloudflare Worker proxy.
+ * The API key lives in the Worker's environment — never in this file.
+ * Update PROXY_URL if you redeploy the Worker.
  *
  * PROVIDER SWITCHING
  * ──────────────────
@@ -19,37 +14,30 @@
  */
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ██  PROXY CONFIGURATION  ────────────────────────────────────────────────────
+// ██  PROXY + PROVIDER CONFIGURATION  ─────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Cloudflare Worker URL that proxies requests to Groq.
- * The Worker holds the API key in its environment — it never appears here.
- * Update this if you redeploy the Worker under a different name.
+ * Cloudflare Worker URL — holds the Groq API key server-side.
+ * The browser sends requests here; the Worker forwards them to Groq with auth.
  */
 const PROXY_URL = "https://deepdive-llm-proxy.mohamed-salem930.workers.dev";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// ██  PROVIDER CONFIGURATION  ─────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Change this one line to switch providers. */
+/** Change this one line to switch LLM providers. */
 const ACTIVE_PROVIDER = "groq";
 
 const PROVIDERS = {
 
   groq: {
     label:     "Groq · Llama 3.3",
-    // Requests go to the Cloudflare Worker, which forwards to Groq with the key.
-    // The browser never sees or sends the API key.
-    baseUrl:   PROXY_URL,
+    baseUrl:   PROXY_URL,          // proxied — key is in the Worker
     model:     "llama-3.3-70b-versatile",
-    keyHeader: "",     // no key header — the Worker handles auth
+    keyHeader: "",                 // Worker adds auth header
     keyPrefix: "",
-    needsKey:  false,  // key lives in Cloudflare, not here
+    needsKey:  false,              // key is server-side
 
-    buildBody(messages, systemPrompt) {
-      return {
+    buildBody(messages, systemPrompt, tools) {
+      const body = {
         model: this.model,
         messages: [
           { role: "system", content: systemPrompt },
@@ -59,10 +47,18 @@ const PROVIDERS = {
         max_tokens:  4096,
         stream:      false,
       };
+      // Attach Groq web-search tool definition if requested
+      if (tools) body.tools = tools;
+      return body;
     },
 
     extractText(data) {
-      return data?.choices?.[0]?.message?.content ?? "";
+      // Handle both standard text replies and tool-use replies
+      const msg = data?.choices?.[0]?.message;
+      if (!msg) return "";
+      // If the model used a tool, we get tool_calls — but for web search
+      // Groq returns the final answer in content after tool resolution.
+      return msg.content ?? "";
     },
   },
 
@@ -117,125 +113,197 @@ const PROVIDERS = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Local bridge server URL (only used when HARDCODED_API_KEY is empty)
+// Local bridge server (only used if PROXY_URL is empty and needsKey=true)
 // ─────────────────────────────────────────────────────────────────────────────
 const LOCAL_SERVER_URL = "http://localhost:7432";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// System prompts
+// Groq web-search tool definition
 // ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Groq's compound-beta model supports a built-in web_search tool.
+ * We use llama-3.3-70b-versatile with tools enabled for literature searches.
+ * When tools are passed, Groq may call web_search and return enriched results.
+ */
+const WEB_SEARCH_TOOL = {
+  type: "function",
+  function: {
+    name:        "web_search",
+    description: "Search the web for recent research, papers, and evidence.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type:        "string",
+          description: "The search query to run.",
+        },
+      },
+      required: ["query"],
+    },
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ██  SYSTEM PROMPTS  ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// All prompts are written in plain English — no jargon like "DAG", "node",
+// "acyclic", or "root". The output JSON still uses those field names internally
+// because the code depends on them, but the user never sees that language.
 
 /**
- * ONBOARDING SYSTEM PROMPT
- * ─────────────────────────
- * Critical design goals:
- *   1. Ask about directionality explicitly — "what causes what?"
- *   2. Ask about moderators/interactions — "does X change the effect of Y on Z?"
- *   3. Produce a fully connected graph with real edges, never an unconnected node set.
- *   4. Spread nodes across the canvas with varied x/y coordinates (not all at 0,0).
- *   5. The JSON must be emitted in a single line with the DEEPDIVE_DAG_JSON: prefix.
+ * ONBOARDING PROMPT
+ * ──────────────────
+ * Used during the guided setup conversation.
+ * Adjusted dynamically to include dataset headers when a file has been uploaded.
+ *
+ * @param {string[]} headers  — column names from the uploaded dataset (may be empty)
  */
-const ONBOARDING_SYSTEM_PROMPT = `
-You are DeepDive's onboarding assistant. Help the user build a causal DAG
-(Directed Acyclic Graph) through a warm, focused conversation.
+function buildOnboardingPrompt(headers) {
+  const hasDataset = headers && headers.length > 0;
+  const headerList = hasDataset
+    ? `\n\nThe user has uploaded a dataset with these columns:\n${headers.map(h => `  • ${h}`).join("\n")}\nUse these as the variables in the process map wherever they fit.`
+    : "";
 
-CONVERSATION FLOW — follow this exactly, one question at a time:
+  return `
+You are DeepDive's friendly setup assistant. Your job is to help the user build
+a visual map of causes and effects — a diagram that shows how different factors
+in their situation connect to and influence each other.
+
+Do NOT use technical terms like "DAG", "node", "edge", "acyclic", "root", or
+"leaf". Instead use plain words:
+  - "variable" or "factor" instead of node
+  - "connection" or "arrow" instead of edge
+  - "starting factor" instead of root node
+  - "outcome" instead of leaf node
+  - "cause-and-effect map" or "process map" instead of DAG${headerList}
+
+CONVERSATION FLOW — ask ONE question at a time, be warm and concise:
+──────────────────────────────────────────────────────────────────────
+${hasDataset
+  ? `Step 1. Tell the user you've seen their dataset and list the columns. Ask which column is the outcome they most care about predicting or explaining.
+Step 2. Ask what other factors in the dataset they think influence that outcome.
+Step 3. Ask about the direction of each influence — does factor A affect factor B, or is it the other way around?
+Step 4. Ask if any factor changes HOW another factor affects the outcome (e.g. "does age change how exercise affects health?").
+Step 5. Ask if there are important factors NOT in the dataset that should still appear in the map.`
+  : `Step 1. Ask what process, situation, or question the user wants to map out.
+Step 2. Ask what the main outcome or result they care about is.
+Step 3. Ask what factors cause or influence that outcome.
+Step 4. Ask about direction — does factor A affect factor B, or vice versa? Any two-way relationships to simplify?
+Step 5. Ask if any factor changes HOW another factor affects the outcome.
+Step 6. Ask about the nature of each factor — is it something measured as a number, a yes/no, categories, or a count?`}
+
+When you have enough information (after the steps above, or if the user says
+they're ready), say: "I have enough to build your map! Here it is:"
+Then on THE VERY NEXT LINE emit ONLY this — nothing else on that line:
+DEEPDIVE_DAG_JSON:<json>
+
+CRITICAL RULES FOR THE JSON — breaking these will break the app:
 ────────────────────────────────────────────────────────────────
-Step 1. Ask what phenomenon or system the user wants to model.
-Step 2. Ask what the main outcome variable is (the thing they most want to explain or predict).
-Step 3. Ask what variables they think CAUSE or INFLUENCE that outcome.
-Step 4. Ask explicitly: "For each cause you mentioned, what direction does the effect go?
-        Does A cause B, or does B cause A? Are there any feedback loops we should simplify?"
-Step 5. Ask: "Are there any moderators or interactions — situations where the effect of
-        one variable on another CHANGES depending on a third variable?"
-Step 6. Ask about variable types if not obvious (binary, count, continuous, categorical).
-Step 7. When you have enough information (after steps 1-6, or if the user says they're done),
-        say: "I have enough to build your DAG! Here it is:"
-        Then on THE VERY NEXT LINE, emit ONLY the JSON — nothing before or after it on that line:
-        DEEPDIVE_DAG_JSON:<json>
+1. JSON on a SINGLE LINE immediately after DEEPDIVE_DAG_JSON:
+2. edges array MUST be non-empty — every factor must connect to at least one other.
+3. No cycles (A→B→A is not allowed). No self-loops (A→A).
+4. root_ids = ids of factors with no incoming connections.
+5. leaf_ids  = ids of factors with no outgoing connections (the outcomes).
+6. parents map: if edge [A,B] exists, then B's parents include A.
+7. SPREAD FACTORS across the canvas:
+   - Canvas: ~820px wide × 520px tall
+   - Starting factors (root_ids) near top: y between 60–120
+   - Outcome factors (leaf_ids) near bottom: y between 380–460
+   - Middle factors spread vertically in between
+   - Spread horizontally: x between 80–740, no two factors at the same position
 
-CRITICAL JSON RULES — violations will break the app:
-─────────────────────────────────────────────────────
-1. The JSON must be valid and complete on a SINGLE LINE immediately after DEEPDIVE_DAG_JSON:
-2. Every node MUST appear in at least one edge (no isolated nodes).
-3. edges array MUST be non-empty — a DAG with no edges is useless.
-4. The graph MUST be acyclic (no cycles, no self-loops).
-5. root_ids = node ids with NO incoming edges. leaf_ids = node ids with NO outgoing edges.
-6. parents map MUST be consistent with edges: if [A,B] is in edges, then B's parents include A.
-7. SPREAD THE NODES across the canvas using varied x and y coordinates:
-   - Canvas is roughly 800px wide × 500px tall
-   - Place root nodes near the top (y: 60-120), leaves near the bottom (y: 380-460)
-   - Spread nodes horizontally so they don't overlap (x values from 80 to 720)
-   - No two nodes should have the same x AND y values
-   - Example spread for 5 nodes: x values like 100, 250, 400, 550, 650
-
-NODE SCHEMA (each node in the nodes array):
-────────────────────────────────────────────
-{
-  "id": <integer, 1-indexed, unique>,
-  "name": <string, max 14 chars, no spaces, snake_case or CamelCase>,
-  "emoji": <single emoji character that represents the concept>,
-  "x": <integer, 80 to 720>,
-  "y": <integer, 60 to 460>,
-  "var_type": <"continuous" | "binary" | "ordinal" | "categorical" | "count">
-}
+FACTOR (NODE) SCHEMA:
+{ "id":<int 1-indexed>, "name":<string max 14 chars no spaces>,
+  "emoji":<single fun emoji>, "x":<80-740>, "y":<60-460>,
+  "var_type":<"continuous"|"binary"|"ordinal"|"categorical"|"count"> }
 
 FULL JSON SCHEMA:
-─────────────────
-{
-  "nodes": [...],
-  "edges": [[src_id, tgt_id], ...],
-  "root_ids": [...],
-  "leaf_ids": [...],
-  "parents": {"<node_id_string>": [<parent_id>, ...], ...},
-  "var_types": {"<node_id_string>": "<var_type>", ...},
-  "levels": {}
+{ "nodes":[...], "edges":[[src_id,tgt_id],...],
+  "root_ids":[...], "leaf_ids":[...],
+  "parents":{"<id>":[parent_ids],...},
+  "var_types":{"<id>":"var_type",...}, "levels":{} }
+
+EXAMPLE — Rain causes wet ground, which causes slipping:
+DEEPDIVE_DAG_JSON:{"nodes":[{"id":1,"name":"Rain","emoji":"🌧️","x":400,"y":80,"var_type":"binary"},{"id":2,"name":"WetGround","emoji":"💧","x":250,"y":270,"var_type":"continuous"},{"id":3,"name":"Slip","emoji":"🩹","x":400,"y":440,"var_type":"binary"}],"edges":[[1,2],[2,3]],"root_ids":[1],"leaf_ids":[3],"parents":{"1":[],"2":[1],"3":[2]},"var_types":{"1":"binary","2":"continuous","3":"binary"},"levels":{}}
+
+Be warm, encouraging, and non-technical. Never emit the JSON until you have
+collected enough information through conversation. Never leave edges empty.
+`.trim();
 }
 
-EXAMPLE of a valid 3-node DAG (Rain → WetGround → Slip):
-DEEPDIVE_DAG_JSON:{"nodes":[{"id":1,"name":"Rain","emoji":"🌧️","x":400,"y":80,"var_type":"binary"},{"id":2,"name":"WetGround","emoji":"💧","x":400,"y":270,"var_type":"continuous"},{"id":3,"name":"Slip","emoji":"🩹","x":400,"y":440,"var_type":"binary"}],"edges":[[1,2],[2,3]],"root_ids":[1],"leaf_ids":[3],"parents":{"1":[],"2":[1],"3":[2]},"var_types":{"1":"binary","2":"continuous","3":"binary"},"levels":{}}
-
-Be warm, encouraging, and concise. Never produce the JSON until you have asked at
-least steps 1-4. Never produce an empty edges array.
-`.trim();
-
 /**
- * CHAT SYSTEM PROMPT — used after onboarding is complete.
+ * CHAT PROMPT — used after the map is built.
+ * @param {string[]} headers  — dataset column names (may be empty)
  */
-const CHAT_SYSTEM_PROMPT = `
-You are DeepDive's causal modelling assistant. The user has built (or is building)
-a causal DAG. Help them refine it, understand it, or answer questions about
-causal reasoning, DAG structure, confounders, mediators, and moderators.
+function buildChatPrompt(headers) {
+  const headerCtx = headers?.length
+    ? `\n\nThe user's dataset columns are: ${headers.join(", ")}.`
+    : "";
 
-If the user asks you to rebuild or modify the DAG, emit the updated graph on its
-own line using this format (no other text on that line):
+  return `
+You are DeepDive's cause-and-effect mapping assistant. The user has built (or
+is building) a visual map of how factors connect and influence each other.${headerCtx}
+
+Speak in plain English — avoid jargon like "DAG", "node", "acyclic", "root node".
+Use "factor" or "variable" instead of node, "connection" instead of edge,
+"outcome" instead of leaf, "starting factor" instead of root.
+
+You can help the user:
+- Refine their map by adding or removing connections
+- Understand what the map means
+- Answer questions about cause and effect, confounders, and feedback
+- Search the research literature for evidence about their factors (use web search)
+
+If the user asks you to change or rebuild the map, emit the updated version:
 DEEPDIVE_DAG_JSON:{"nodes":[...],"edges":[...],"root_ids":[...],"leaf_ids":[...],"parents":{...},"var_types":{...},"levels":{}}
 
-When emitting a DAG:
-- ALWAYS include edges (never emit a DAG with an empty edges array)
-- Spread nodes across the canvas (x: 80-720, y: 60-460, roots at top, leaves at bottom)
-- Make parents map consistent with edges
+Rules when emitting a map:
+- edges must be non-empty
+- Spread factors across the canvas (x: 80-740, y: 60-460, outcomes near bottom)
+- parents map must match edges
 
-Keep replies concise and conversational.
+Keep replies concise and friendly.
 `.trim();
+}
 
 /**
- * SINGLE-SHOT TEXT-TO-DAG — used by the quick-generate action.
+ * LITERATURE SEARCH PROMPT
+ * Instructs the LLM to use web search to find evidence for each variable's
+ * relationship to the chosen outcome, then classify them.
+ *
+ * @param {string[]} headers      — all dataset columns
+ * @param {string}   responseVar  — the chosen outcome variable
  */
-const TEXT_TO_DAG_SYSTEM_PROMPT = `
-Convert the user's description into a causal DAG. Return ONLY the following line and nothing else:
-DEEPDIVE_DAG_JSON:{"nodes":[...],"edges":[...],"root_ids":[...],"leaf_ids":[...],"parents":{...},"var_types":{...},"levels":{}}
+function buildLiteraturePrompt(headers, responseVar) {
+  const otherVars = headers.filter(h => h !== responseVar);
+  return `
+The user has a dataset with these columns: ${headers.join(", ")}.
+Their outcome of interest is: "${responseVar}".
+The other variables are: ${otherVars.join(", ")}.
 
-Node schema: {"id":<int>,"name":<string max 14 chars no spaces>,"emoji":<single emoji>,"x":<80-720>,"y":<60-460>,"var_type":<"continuous"|"binary"|"ordinal"|"categorical"|"count">}
+Use your web search capability to find research evidence for whether each of
+the other variables is associated with or causes "${responseVar}".
 
-Rules:
-- MUST include edges — never return an empty edges array.
-- Roots (no parents) go near top (y: 60-120). Leaves (no children) near bottom (y: 380-460).
-- Spread nodes horizontally so they don't overlap.
-- parents map must be consistent with edges.
-- 4-12 nodes. Acyclic. Memorable emoji for every node.
-- Return ONLY the DEEPDIVE_DAG_JSON line. No explanation, no markdown.
+For each variable, search for recent research, meta-analyses, or established
+findings. Then produce a plain-English summary structured as follows:
+
+**Variables found in your dataset with research support:**
+List each variable in the dataset (other than ${responseVar}) that has solid
+research evidence linking it to ${responseVar}. For each, write 1-2 sentences
+describing what the evidence says.
+
+**Variables in your dataset with limited or mixed evidence:**
+List any dataset variables where the research is unclear or mixed.
+
+**Important factors NOT in your dataset:**
+Based on the research you find, list factors that are well-established as
+influences on ${responseVar} but are missing from the dataset. Suggest adding
+them to the cause-and-effect map.
+
+Be concise, plain, and non-technical. Avoid jargon. Do not produce any JSON.
+This is purely a research summary for the user to read.
 `.trim();
+}
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -243,9 +311,15 @@ Rules:
 // ─────────────────────────────────────────────────────────────────────────────
 
 let _apiKey    = null;
-let _keyStatus = "unknown"; // "ok" | "missing" | "error" | "unknown"
+let _keyStatus = "unknown";
 
-/** Resolved provider config. */
+/**
+ * Dataset state — persists for the whole session.
+ * Set by parseAndStoreDataset(), read by prompts and literature search.
+ */
+let _datasetHeaders  = [];    // string[] — column names
+let _datasetFilename = "";    // display name shown in chat
+
 const _provider = PROVIDERS[ACTIVE_PROVIDER];
 
 
@@ -255,25 +329,19 @@ const _provider = PROVIDERS[ACTIVE_PROVIDER];
 
 /**
  * Initialise the LLM connection.
- *
- * When using the Cloudflare Worker proxy (needsKey = false), this resolves
- * immediately — no network call needed since the key lives in the Worker.
- *
- * When using a provider that needs a key directly (e.g. Ollama switched to
- * a keyed provider), it falls back to fetching from local_server.py.
+ * Proxy mode resolves immediately — no network call needed.
+ * Direct mode falls back to local_server.py.
  *
  * @param {function} onStatus  callback(message, type)
  */
 async function fetchApiKey(onStatus) {
-  // Proxy mode — key is held by the Cloudflare Worker, not by us
   if (!_provider.needsKey) {
-    _apiKey    = "proxy";   // sentinel value — not a real key
+    _apiKey    = "proxy";
     _keyStatus = "ok";
     onStatus(`Provider: ${_provider.label} ✓`, "ok");
     return;
   }
 
-  // Direct mode — fetch key from local bridge server
   onStatus("Connecting to DeepDive local server…", "info");
   try {
     const res = await fetch(`${LOCAL_SERVER_URL}/gemini_key`, {
@@ -285,12 +353,8 @@ async function fetchApiKey(onStatus) {
       _keyStatus = "ok";
       onStatus(`Connected ✓  Provider: ${_provider.label}`, "ok");
     } else {
-      const err  = await res.json().catch(() => ({}));
       _keyStatus = "missing";
-      onStatus(
-        `API key not set. ${err.hint || "Set the key env var and restart local_server.py."}`,
-        "warn"
-      );
+      onStatus("API key not configured on server.", "warn");
     }
   } catch {
     _keyStatus = "error";
@@ -298,10 +362,109 @@ async function fetchApiKey(onStatus) {
   }
 }
 
-/** Returns true if we have a working key and can make LLM calls. */
 function llmReady() {
   return _keyStatus === "ok" && !!_apiKey;
 }
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dataset parsing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Parse a File object (CSV or XLSX) and extract the header row.
+ * Stores headers in module state for use by prompts.
+ *
+ * CSV: parsed natively in the browser using string splitting — no library needed.
+ * XLSX: parsed using SheetJS (loaded via CDN in index.html).
+ *
+ * @param {File}     file       — the uploaded File object
+ * @param {function} onStatus   — callback(message, type)
+ * @returns {Promise<string[]>} — array of column header strings
+ */
+async function parseAndStoreDataset(file, onStatus) {
+  onStatus("Reading your file…", "info");
+
+  let headers = [];
+
+  try {
+    const ext = file.name.split(".").pop().toLowerCase();
+
+    if (ext === "csv") {
+      // ── CSV: read as text, split on first line ────────────────────────────
+      const text  = await file.text();
+      const lines = text.split(/\r?\n/).filter(l => l.trim());
+      if (lines.length === 0) throw new Error("File appears to be empty.");
+
+      // Detect delimiter: comma, semicolon, or tab
+      const firstLine = lines[0];
+      const delim = firstLine.includes("\t") ? "\t"
+                  : firstLine.includes(";")  ? ";"
+                  : ",";
+
+      // Parse headers — handle quoted fields
+      headers = _parseCSVRow(firstLine, delim);
+
+    } else if (ext === "xlsx" || ext === "xls") {
+      // ── XLSX: use SheetJS (window.XLSX must be loaded) ────────────────────
+      if (!window.XLSX) {
+        throw new Error("SheetJS not loaded. Check your internet connection.");
+      }
+      const arrayBuffer = await file.arrayBuffer();
+      const workbook    = window.XLSX.read(arrayBuffer, { type: "array" });
+      const firstSheet  = workbook.Sheets[workbook.SheetNames[0]];
+      const rows        = window.XLSX.utils.sheet_to_json(firstSheet, { header: 1 });
+      if (!rows || rows.length === 0) throw new Error("Spreadsheet appears to be empty.");
+      headers = rows[0].map(h => String(h).trim()).filter(Boolean);
+
+    } else {
+      throw new Error(`Unsupported file type ".${ext}". Please upload a CSV or XLSX file.`);
+    }
+
+    if (headers.length === 0) throw new Error("Could not find any column headers.");
+
+    // Store in module state — persists for the whole session
+    _datasetHeaders  = headers;
+    _datasetFilename = file.name;
+
+    onStatus(`Loaded "${file.name}" — ${headers.length} columns found.`, "ok");
+    return headers;
+
+  } catch (e) {
+    onStatus(`Could not read file: ${e.message}`, "error");
+    return [];
+  }
+}
+
+/**
+ * Parse a single CSV row, respecting quoted fields.
+ * e.g.  `"Name","Age","City, State"` → ["Name", "Age", "City, State"]
+ */
+function _parseCSVRow(row, delim = ",") {
+  const result = [];
+  let current  = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < row.length; i++) {
+    const ch = row[i];
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+    } else if (ch === delim && !inQuotes) {
+      result.push(current.trim());
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current.trim());
+  return result.filter(Boolean);
+}
+
+/** Return the currently stored dataset headers (empty array if none uploaded). */
+function getDatasetHeaders() { return _datasetHeaders; }
+
+/** Return the uploaded filename for display. */
+function getDatasetFilename() { return _datasetFilename; }
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -309,16 +472,16 @@ function llmReady() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Send a list of messages to the active provider and return the reply string.
+ * Send messages to the active provider.
  *
- * @param {Array}  messages      [{role, content}, ...]
- * @param {string} systemPrompt
+ * @param {Array}   messages      [{role, content}, ...]
+ * @param {string}  systemPrompt
+ * @param {Array}   tools         optional Groq tool definitions
  * @returns {Promise<string|null>}
  */
-async function _callLLM(messages, systemPrompt) {
+async function _callLLM(messages, systemPrompt, tools = null) {
   if (!llmReady()) return null;
 
-  // In proxy mode the Worker handles the Authorization header — we send only Content-Type
   const headers = { "Content-Type": "application/json" };
   if (_provider.needsKey && _provider.keyHeader && _apiKey !== "proxy") {
     headers[_provider.keyHeader] = `${_provider.keyPrefix}${_apiKey}`;
@@ -328,8 +491,8 @@ async function _callLLM(messages, systemPrompt) {
     const res = await fetch(_provider.baseUrl, {
       method:  "POST",
       headers,
-      body:    JSON.stringify(_provider.buildBody(messages, systemPrompt)),
-      signal:  AbortSignal.timeout(45_000),   // 45s — large DAG JSON can be slow
+      body:    JSON.stringify(_provider.buildBody(messages, systemPrompt, tools)),
+      signal:  AbortSignal.timeout(60_000),   // 60s — web search replies take longer
     });
 
     if (!res.ok) {
@@ -348,94 +511,64 @@ async function _callLLM(messages, systemPrompt) {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layout helper — spread nodes across the canvas regardless of LLM coordinates
+// Layout helper
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Assign good canvas coordinates to every node in the graph.
- * Called whenever the LLM returns all-zero or all-same coordinates.
- *
- * Uses a simple layered layout:
- *   - Compute each node's "layer" = longest path from any root
- *   - Spread layers top (roots) to bottom (leaves)
- *   - Within each layer, spread nodes evenly across the horizontal axis
- *
- * Canvas assumptions: ~820px wide × 520px tall (matches the CSS flex layout).
- *
- * @param {object} graph  - the parsed graph object (mutated in place)
+ * Spread nodes across the canvas using a layered layout.
+ * Called whenever the LLM returns all-zero coordinates.
+ * Mutates graph.nodes in place.
  */
 function _spreadNodes(graph) {
   const nodes = graph.nodes || [];
   const edges = graph.edges || [];
   if (nodes.length === 0) return;
 
-  const CANVAS_W = 820;
-  const CANVAS_H = 520;
-  const PAD_X    = 80;    // horizontal padding from edge
-  const PAD_Y    = 70;    // vertical padding from edge
+  const CW = 820, CH = 520, PX = 80, PY = 70;
 
-  // Build children map for topological ordering
-  const children = {};
-  const inDeg    = {};
-  for (const n of nodes) { children[n.id] = []; inDeg[n.id] = 0; }
-  for (const [src, tgt] of edges) {
-    children[src].push(tgt);
-    inDeg[tgt]++;
-  }
+  // Build in-degree and children maps
+  const inDeg    = {}, children = {};
+  for (const n of nodes) { inDeg[n.id] = 0; children[n.id] = []; }
+  for (const [s, t] of edges) { children[s].push(t); inDeg[t]++; }
 
-  // Kahn's topological sort to get layer depths (longest-path ranking)
+  // Longest-path layer assignment via topological sort
   const layer = {};
   for (const n of nodes) layer[n.id] = 0;
   const queue = nodes.filter(n => inDeg[n.id] === 0).map(n => n.id);
-  const visited = [];
   const inDegCopy = { ...inDeg };
   while (queue.length) {
     const id = queue.shift();
-    visited.push(id);
-    for (const child of (children[id] || [])) {
-      layer[child] = Math.max(layer[child], layer[id] + 1);
-      if (--inDegCopy[child] === 0) queue.push(child);
+    for (const c of children[id]) {
+      layer[c] = Math.max(layer[c], layer[id] + 1);
+      if (--inDegCopy[c] === 0) queue.push(c);
     }
   }
-  // If there's a cycle (shouldn't happen but guard anyway), assign remaining nodes to layer 0
-  for (const n of nodes) { if (layer[n.id] === undefined) layer[n.id] = 0; }
 
-  // Group nodes by layer
+  // Group by layer
   const byLayer = {};
   for (const n of nodes) {
-    const l = layer[n.id];
+    const l = layer[n.id] ?? 0;
     if (!byLayer[l]) byLayer[l] = [];
     byLayer[l].push(n.id);
   }
   const layerNums = Object.keys(byLayer).map(Number).sort((a, b) => a - b);
-  const numLayers = layerNums.length;
+  const nL = layerNums.length;
 
-  // Assign pixel coordinates
+  // Assign pixel positions
   for (const l of layerNums) {
-    const nodesInLayer = byLayer[l];
-    const numInLayer   = nodesInLayer.length;
-    const y = numLayers === 1
-      ? CANVAS_H / 2
-      : PAD_Y + (l / (numLayers - 1)) * (CANVAS_H - 2 * PAD_Y);
-
-    nodesInLayer.forEach((id, i) => {
-      const x = numInLayer === 1
-        ? CANVAS_W / 2
-        : PAD_X + (i / (numInLayer - 1)) * (CANVAS_W - 2 * PAD_X);
+    const ids = byLayer[l];
+    const nN  = ids.length;
+    const y   = nL === 1 ? CH / 2 : PY + (l / (nL - 1)) * (CH - 2 * PY);
+    ids.forEach((id, i) => {
+      const x    = nN === 1 ? CW / 2 : PX + (i / (nN - 1)) * (CW - 2 * PX);
       const node = nodes.find(n => n.id === id);
-      if (node) {
-        node.x = Math.round(x);
-        node.y = Math.round(y);
-      }
+      if (node) { node.x = Math.round(x); node.y = Math.round(y); }
     });
   }
 }
 
-/**
- * Returns true if all nodes have x=0 and y=0 (LLM ignored coordinates).
- */
 function _allZeroCoords(graph) {
-  return (graph.nodes || []).every(n => (n.x === 0 || !n.x) && (n.y === 0 || !n.y));
+  return (graph.nodes || []).every(n => (!n.x || n.x === 0) && (!n.y || n.y === 0));
 }
 
 
@@ -444,81 +577,56 @@ function _allZeroCoords(graph) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Scan an LLM reply for the DEEPDIVE_DAG_JSON: marker, parse and repair the graph.
- *
- * Repairs applied automatically:
- *   - Strips markdown code fences the LLM adds despite being told not to
- *   - Recomputes root_ids, leaf_ids, and parents map from the edges array
- *   - Fills in missing var_types
- *   - Spreads node coordinates if the LLM returned all-zero positions
- *
- * Returns { graph: null, cleanText } if no valid graph is found.
- * NOTE: unlike the previous version, we NO LONGER reject graphs with empty
- * edges here — rejection + retry is handled by the caller (onboardingTurn).
+ * Find the DEEPDIVE_DAG_JSON: marker in an LLM reply and return the parsed graph.
+ * Repairs root_ids, leaf_ids, parents, var_types automatically.
+ * Spreads coordinates if all-zero.
+ * Does NOT reject edgeless graphs here — callers handle that with a retry.
  */
 function extractDAGFromReply(replyText) {
   const MARKER = "DEEPDIVE_DAG_JSON:";
 
-  // Strip markdown fences if the LLM wrapped the whole reply
   let text = replyText.trim();
-  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/s);
-  if (fenceMatch && fenceMatch[1].includes(MARKER)) {
-    text = fenceMatch[1].trim();
-  }
+  // Strip markdown fences the LLM sometimes wraps around the JSON
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/s);
+  if (fence && fence[1].includes(MARKER)) text = fence[1].trim();
 
   const idx = text.indexOf(MARKER);
   if (idx === -1) return { graph: null, cleanText: replyText };
 
-  // JSON runs from after the marker to the first newline
-  const afterMarker = text.slice(idx + MARKER.length).trim();
-  const jsonStr     = afterMarker.split("\n")[0].trim();
-  const cleanText   = text.slice(0, idx).trim();
+  const jsonStr   = text.slice(idx + MARKER.length).trim().split("\n")[0].trim();
+  const cleanText = text.slice(0, idx).trim();
 
   let graph;
-  try {
-    graph = JSON.parse(jsonStr);
-  } catch (e) {
+  try { graph = JSON.parse(jsonStr); }
+  catch (e) {
     console.error("DAG JSON parse failed:", jsonStr, e);
     return { graph: null, cleanText: replyText };
   }
 
-  if (!graph.nodes || graph.nodes.length === 0) {
-    return { graph: null, cleanText: replyText };
-  }
-
-  // ── Repair: ensure edges array exists ──────────────────────────────────────
+  if (!graph.nodes?.length) return { graph: null, cleanText: replyText };
   if (!graph.edges) graph.edges = [];
 
-  // ── Repair: recompute root_ids, leaf_ids, parents from edges ───────────────
-  // (LLM frequently gets these wrong even when edges are correct)
+  // Repair topology fields
   const allIds    = graph.nodes.map(n => n.id);
   const hasParent = new Set(graph.edges.map(([, t]) => t));
   const hasChild  = new Set(graph.edges.map(([s]) => s));
   graph.root_ids  = allIds.filter(id => !hasParent.has(id));
   graph.leaf_ids  = allIds.filter(id => !hasChild.has(id));
-
-  graph.parents = {};
+  graph.parents   = {};
   for (const id of allIds) graph.parents[String(id)] = [];
-  for (const [src, tgt] of graph.edges) {
-    const k = String(tgt);
+  for (const [s, t] of graph.edges) {
+    const k = String(t);
     if (!graph.parents[k]) graph.parents[k] = [];
-    if (!graph.parents[k].includes(src)) graph.parents[k].push(src);
+    if (!graph.parents[k].includes(s)) graph.parents[k].push(s);
   }
 
-  // ── Repair: fill missing var_types ─────────────────────────────────────────
   if (!graph.var_types) graph.var_types = {};
-  for (const node of graph.nodes) {
-    if (!graph.var_types[String(node.id)]) {
-      graph.var_types[String(node.id)] = node.var_type || "continuous";
-    }
+  for (const n of graph.nodes) {
+    if (!graph.var_types[String(n.id)])
+      graph.var_types[String(n.id)] = n.var_type || "continuous";
   }
 
-  // ── Repair: spread coordinates if LLM ignored the layout instructions ──────
-  // This is the primary fix for "all nodes in top-left corner"
-  if (_allZeroCoords(graph)) {
-    _spreadNodes(graph);
-  }
-
+  if (_allZeroCoords(graph)) _spreadNodes(graph);
   if (!graph.levels) graph.levels = {};
 
   return { graph, cleanText };
@@ -531,7 +639,7 @@ function extractDAGFromReply(replyText) {
 
 /**
  * Send one turn of the guided onboarding conversation.
- * Mutates history in place.
+ * Auto-retries once if the LLM returns a map with no connections.
  *
  * @param {Array}  history
  * @param {string} userMessage
@@ -540,44 +648,37 @@ function extractDAGFromReply(replyText) {
 async function onboardingTurn(history, userMessage) {
   history.push({ role: "user", content: userMessage });
 
-  const raw = await _callLLM(history, ONBOARDING_SYSTEM_PROMPT);
+  const systemPrompt = buildOnboardingPrompt(_datasetHeaders);
+  const raw = await _callLLM(history, systemPrompt);
 
   if (!raw) {
-    const fallback = "Sorry, I couldn't reach the LLM. Check your connection and try again.";
-    history.push({ role: "assistant", content: fallback });
-    return { reply: fallback, graph: null };
+    const fb = "Sorry, I couldn't reach the AI. Check your connection and try again.";
+    history.push({ role: "assistant", content: fb });
+    return { reply: fb, graph: null };
   }
 
   const { graph, cleanText } = extractDAGFromReply(raw);
 
-  // ── Auto-retry if the LLM produced nodes but forgot edges ──────────────────
-  // This is the primary fix for "DAG has no edges".
-  // We inject a correction into the history and call the LLM one more time.
-  if (graph && graph.edges.length === 0 && graph.nodes.length > 0) {
-    console.warn("LLM returned no edges — sending correction and retrying.");
-
-    // Add the bad response to history so the LLM has context
+  // Auto-retry if connections are missing
+  if (graph && graph.edges.length === 0) {
+    console.warn("No connections in map — retrying with correction.");
     history.push({ role: "assistant", content: cleanText || raw });
-
-    const correction =
-      "Your DAG JSON had no edges — every node was disconnected. " +
-      "Please regenerate the DEEPDIVE_DAG_JSON with edges connecting the nodes " +
-      "based on the causal relationships we discussed. " +
-      "The edges array must not be empty.";
-
-    history.push({ role: "user", content: correction });
-
-    const raw2 = await _callLLM(history, ONBOARDING_SYSTEM_PROMPT);
+    history.push({
+      role: "user",
+      content:
+        "The map you generated had no connections between factors. " +
+        "Please regenerate it with arrows showing which factors influence which others. " +
+        "The connections list must not be empty.",
+    });
+    const raw2 = await _callLLM(history, systemPrompt);
     if (raw2) {
       const retry = extractDAGFromReply(raw2);
-      // Apply layout if still all-zero after retry
       if (retry.graph && _allZeroCoords(retry.graph)) _spreadNodes(retry.graph);
       history.push({ role: "assistant", content: retry.cleanText || raw2 });
       return { reply: retry.cleanText || raw2, graph: retry.graph };
     }
   }
 
-  // Normal path — graph is fine (or null, meaning no JSON in this turn yet)
   history.push({ role: "assistant", content: cleanText || raw });
   return { reply: cleanText || raw, graph };
 }
@@ -597,27 +698,25 @@ async function onboardingTurn(history, userMessage) {
 async function chatTurn(history, userMessage) {
   history.push({ role: "user", content: userMessage });
 
-  const raw = await _callLLM(history, CHAT_SYSTEM_PROMPT);
+  const systemPrompt = buildChatPrompt(_datasetHeaders);
+  const raw = await _callLLM(history, systemPrompt);
 
   if (!raw) {
-    const fallback = "LLM unavailable. Check your connection.";
-    history.push({ role: "assistant", content: fallback });
-    return { reply: fallback, graph: null };
+    const fb = "AI unavailable. Check your connection.";
+    history.push({ role: "assistant", content: fb });
+    return { reply: fb, graph: null };
   }
 
   const { graph, cleanText } = extractDAGFromReply(raw);
 
-  // Auto-retry if the LLM produced a DAG with no edges
-  if (graph && graph.edges.length === 0 && graph.nodes.length > 0) {
-    console.warn("Chat LLM returned no edges — retrying with correction.");
+  // Retry if connections missing
+  if (graph && graph.edges.length === 0) {
     history.push({ role: "assistant", content: cleanText || raw });
     history.push({
       role: "user",
-      content:
-        "Your DAG had no edges. Please regenerate it with edges connecting the nodes. " +
-        "The edges array must not be empty.",
+      content: "The map had no connections. Please regenerate with arrows connecting the factors.",
     });
-    const raw2 = await _callLLM(history, CHAT_SYSTEM_PROMPT);
+    const raw2 = await _callLLM(history, systemPrompt);
     if (raw2) {
       const retry = extractDAGFromReply(raw2);
       if (retry.graph && _allZeroCoords(retry.graph)) _spreadNodes(retry.graph);
@@ -632,47 +731,58 @@ async function chatTurn(history, userMessage) {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Single-shot text → DAG
+// Literature / evidence search
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Convert a plain-English description to a DAG in one LLM call.
+ * Use Groq's web search tool to find research evidence for each dataset variable
+ * relative to the chosen outcome, then return a structured plain-English summary.
  *
- * @param {string}   text
- * @param {function} onProgress  callback(message, type)
- * @returns {Promise<object|null>}
+ * This is a single-shot call (not part of the chat history) so it doesn't
+ * pollute the conversation context.
+ *
+ * @param {string}   responseVar  — the chosen outcome column name
+ * @param {function} onProgress   — callback(message, type)
+ * @returns {Promise<string|null>}  the summary text, or null on failure
  */
-async function textToDAG(text, onProgress) {
-  if (!llmReady()) { onProgress("LLM not ready.", "error"); return null; }
-  if (!text.trim()) { onProgress("Enter a description first.", "warn"); return null; }
-
-  onProgress("Generating DAG…", "info");
-
-  const raw = await _callLLM(
-    [{ role: "user", content: text }],
-    TEXT_TO_DAG_SYSTEM_PROMPT
-  );
-
-  if (!raw) { onProgress("No response from LLM. Try again.", "error"); return null; }
-
-  const { graph } = extractDAGFromReply(raw);
-  if (!graph) {
-    onProgress("Could not parse a valid DAG. Try rephrasing.", "warn");
+async function searchLiterature(responseVar, onProgress) {
+  if (!llmReady()) {
+    onProgress("AI not available for literature search.", "error");
+    return null;
+  }
+  if (!_datasetHeaders.length) {
+    onProgress("No dataset uploaded — please upload a file first.", "warn");
     return null;
   }
 
-  onProgress(`DAG generated: ${graph.nodes?.length} nodes, ${graph.edges?.length} edges ✓`, "ok");
-  return graph;
+  onProgress("Searching research literature… this may take 20–30 seconds.", "info");
+
+  const systemPrompt = buildLiteraturePrompt(_datasetHeaders, responseVar);
+  const messages = [{
+    role:    "user",
+    content: `Please search the research literature for evidence about what influences "${responseVar}" and summarise what you find in relation to the variables in my dataset.`,
+  }];
+
+  // Pass the web_search tool so Groq can perform live searches
+  const raw = await _callLLM(messages, systemPrompt, [WEB_SEARCH_TOOL]);
+
+  if (!raw) {
+    onProgress("Literature search failed. Try again.", "error");
+    return null;
+  }
+
+  onProgress("Literature search complete ✓", "ok");
+  return raw;
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Automatic emoji assignment
+// Auto emoji
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Ask the LLM for a single emoji representing a node concept.
- * Called automatically when a node is named. Silent fallback if LLM unavailable.
+ * Ask the LLM for a single emoji for a variable name.
+ * Called automatically when a node is named. Silent fallback if unavailable.
  *
  * @param {string} nodeName
  * @returns {Promise<string>}
@@ -681,35 +791,145 @@ async function autoEmoji(nodeName) {
   if (!llmReady()) return "◈";
 
   const raw = await _callLLM(
-    [{
-      role: "user",
-      content:
-        `Pick exactly one emoji that visually represents "${nodeName}" in a causal model. ` +
-        `Return ONLY the single emoji character — nothing else.`,
-    }],
+    [{ role: "user", content:
+        `Pick exactly one emoji that represents the concept "${nodeName}" ` +
+        `as a variable in a data analysis. Return ONLY the emoji, nothing else.` }],
     "You are an emoji selector. Return exactly one emoji character and nothing else."
   );
 
   if (!raw) return "◈";
-
-  // Extract the first proper emoji, guard against stray text
   const match = raw.trim().match(/\p{Emoji_Presentation}|\p{Emoji}\uFE0F/u);
   return match ? match[0] : (raw.trim().slice(0, 2) || "◈");
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Exports
+// Dataset upload to local server
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Upload a dataset file to the local DeepDive server.
+ *
+ * Sends a multipart/form-data POST to /upload containing:
+ *   file              — the raw file binary
+ *   response_variable — the column name of the response variable
+ *   dag               — the current DAG JSON (stringified), if available
+ *
+ * The server saves the file, launches analyze.py, and returns 202 Accepted.
+ * The browser then polls /upload_status until the job completes.
+ *
+ * @param {File}     file          — the File object from the file input / drop
+ * @param {string}   responseVar   — column name chosen by the user
+ * @param {object}   dagGraph      — current graph dict (may be null)
+ * @param {function} onProgress    — callback(message, type)
+ * @returns {Promise<{ok: boolean, timestamp: string|null}>}
+ */
+async function uploadDataset(file, responseVar, dagGraph, onProgress) {
+  if (!file) {
+    onProgress("No file to upload.", "warn");
+    return { ok: false, timestamp: null };
+  }
+  if (!responseVar) {
+    onProgress("Please identify the response variable before uploading.", "warn");
+    return { ok: false, timestamp: null };
+  }
+
+  onProgress(`Uploading "${file.name}" to local server…`, "info");
+
+  const formData = new FormData();
+  formData.append("file",              file);
+  formData.append("response_variable", responseVar);
+  if (dagGraph) {
+    formData.append("dag", JSON.stringify(dagGraph));
+  }
+
+  try {
+    const res = await fetch(`${LOCAL_SERVER_URL}/upload`, {
+      method: "POST",
+      body:   formData,
+      // Note: do NOT set Content-Type header — the browser sets it automatically
+      // with the correct multipart boundary when using FormData.
+      signal: AbortSignal.timeout(60_000),   // 60s for large files
+    });
+
+    const data = await res.json();
+
+    if (res.ok) {
+      onProgress(
+        `File received by server ✓  Analysis started for "${responseVar}".`,
+        "ok"
+      );
+      return { ok: true, timestamp: data.timestamp };
+    } else {
+      const msg = data.error || "Server rejected the upload.";
+      onProgress(`Upload failed: ${msg}`, "error");
+      return { ok: false, timestamp: null };
+    }
+
+  } catch (e) {
+    onProgress(
+      "Could not reach local server. Is local_server.py running?",
+      "error"
+    );
+    return { ok: false, timestamp: null };
+  }
+}
+
+
+/**
+ * Poll /upload_status until the analysis job finishes or errors.
+ *
+ * Calls onUpdate with the latest status object every 3 seconds.
+ * Resolves when status is "complete" or "error".
+ *
+ * @param {function} onUpdate  callback(statusObject) — called each poll cycle
+ * @returns {Promise<object>}  the final status object
+ */
+async function pollAnalysisStatus(onUpdate) {
+  return new Promise((resolve) => {
+    const interval = setInterval(async () => {
+      try {
+        const res  = await fetch(`${LOCAL_SERVER_URL}/upload_status`, {
+          signal: AbortSignal.timeout(5000),
+        });
+        const data = await res.json();
+        onUpdate(data);
+
+        if (data.status === "complete" || data.status === "error") {
+          clearInterval(interval);
+          resolve(data);
+        }
+      } catch {
+        // Server temporarily unreachable — keep polling
+      }
+    }, 3000);   // poll every 3 seconds
+  });
+}
+
 window.DeepDiveLLM = {
+  // Connection
   fetchApiKey,
   llmReady,
+
+  // Dataset — parsing (browser-side)
+  parseAndStoreDataset,
+  getDatasetHeaders,
+  getDatasetFilename,
+
+  // Dataset — server upload + polling
+  uploadDataset,
+  pollAnalysisStatus,
+
+  // Conversation
   onboardingTurn,
   chatTurn,
-  textToDAG,
+
+  // Features
+  searchLiterature,
   autoEmoji,
   extractDAGFromReply,
+
+  // Metadata
   providerLabel:    _provider.label,
   LOCAL_SERVER_URL,
 };

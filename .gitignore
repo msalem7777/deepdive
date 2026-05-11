@@ -1,0 +1,38 @@
+# DeepDive — gitignore
+# ════════════════════════════════════════════════════════════════════════
+# User data — never committed to the repo.
+# These folders are created automatically by local_server.py.
+
+# Uploaded datasets (may contain sensitive user data)
+datasets/
+
+# Analysis results (predictions, model weights)
+results/
+
+# DAG JSON files saved by the server (optional — remove this line
+# if you want to track your saved graphs in git)
+dag_outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.env
+.venv
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

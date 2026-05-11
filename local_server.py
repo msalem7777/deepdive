@@ -1,45 +1,42 @@
 """
 local_server.py
 ════════════════════════════════════════════════════════════════════════════════
-DeepDive — Lightweight local HTTP server that acts as the bridge between the
-GitHub Pages web frontend and your local Python environment (dag_sampler.py, etc.).
+DeepDive — Local bridge server.
 
-HOW IT WORKS
-────────────
-1. You run this script once:  python local_server.py
-2. The web frontend (hosted on GitHub Pages) POSTs DAG JSON to:
-       http://localhost:<PORT>/dag
-3. This server validates the payload, saves it to disk, and (optionally)
-   immediately triggers dag_sampler.py to generate synthetic data.
-4. A /status endpoint lets the frontend poll whether the server is alive.
-5. A /result endpoint lets the frontend poll for the latest saved DAG path.
+ENDPOINTS
+─────────
+  GET  /status          Health check; returns server state.
+  GET  /gemini_key      Returns the LLM API key from env (GEMINI_API_KEY).
+  POST /dag             Receive and save a DAG JSON from the web frontend.
+  GET  /result          Poll for the latest saved DAG path.
+  POST /upload          Receive a dataset file + DAG metadata. Saves the file
+                        to datasets/, saves the DAG to dag_outputs/, then
+                        launches analyze.py in a background process.
+  GET  /upload_status   Poll for the status of the running analysis job.
+  GET  /download/<name> Serve a file from results/ (predictions CSV, model).
 
-CROSS-ORIGIN (CORS)
-───────────────────
-GitHub Pages runs on a different origin than localhost, so every response
-includes the appropriate Access-Control-Allow-* headers.  The ALLOWED_ORIGINS
-list below controls which origins are trusted.  Add your GitHub Pages URL once
-you have it (e.g. "https://yourname.github.io").
-
-GEMINI KEY
-──────────
-The Gemini API key is read from the environment variable GEMINI_API_KEY.
-Set it before launching:
-    Windows PowerShell:  $env:GEMINI_API_KEY = "your-key-here"
-    Windows CMD:         set GEMINI_API_KEY=your-key-here
-    Linux / macOS:       export GEMINI_API_KEY=your-key-here
-The /gemini_key endpoint returns the key to the web frontend over localhost
-only — it is NEVER forwarded anywhere other than the Gemini API.
+DATASET PIPELINE
+────────────────
+  Browser  →  POST /upload  (multipart: file + dag JSON + response_variable)
+  Server   →  saves file to datasets/<timestamp>_<filename>
+           →  saves DAG  to dag_outputs/<timestamp>.json
+           →  runs:  python analyze.py
+                       --input   datasets/<file>
+                       --response <column_name>
+                       --dag     dag_outputs/<timestamp>.json
+                       --output  results/<timestamp>/
+  Browser  →  polls GET /upload_status until status == "complete" | "error"
+           →  receives predictions_url + optional model_url in the response
 
 REQUIREMENTS
 ────────────
     pip install flask flask-cors
-    (dag_sampler.py must be in the same directory or on PYTHONPATH)
+    analyze.py must be in the same directory as local_server.py.
 
 USAGE
 ─────
-    python local_server.py                      # default port 7432
-    python local_server.py --port 8080          # custom port
+    python local_server.py               # default port 7432
+    python local_server.py --port 8080   # custom port
 """
 
 from __future__ import annotations
@@ -48,15 +45,15 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
-import time
 from datetime import datetime
 from pathlib import Path
 
-# ── Flask + CORS ───────────────────────────────────────────────────────────────
+# ── Flask + CORS ──────────────────────────────────────────────────────────────
 try:
-    from flask import Flask, jsonify, request, abort
+    from flask import Flask, jsonify, request, send_file
     from flask_cors import CORS
 except ImportError:
     print(
@@ -66,37 +63,40 @@ except ImportError:
     sys.exit(1)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION  (edit these if needed)
+# CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Default port.  7432 is arbitrary but unlikely to conflict with common services
-# (Flask=5000, React=3000, Vite=5173, macOS AirPlay=5000, etc.)
 DEFAULT_PORT = 7432
 
-# Directory where received DAG JSON files are saved.
-# Created automatically if it does not exist.
-OUTPUT_DIR = Path("dag_outputs")
+# DAG JSON files land here
+DAG_DIR = Path("dag_outputs")
 
-# Which browser origins are allowed to talk to this server.
-# Add your GitHub Pages URL here once you know it.
-# Example: "https://yourname.github.io"
+# Uploaded dataset files land here.
+# This folder is intentionally excluded from the git repo via .gitignore
+# so user data is never committed.
+DATASET_DIR = Path("datasets")
+
+# Analysis script outputs land here (predictions, model, status)
+RESULTS_DIR = Path("results")
+
+# Path to the analysis script (placeholder until the real one is ready)
+ANALYZE_SCRIPT = Path("analyze.py")
+
+# Max upload size — 1 GB expressed in bytes.
+# Flask will reject requests larger than this before they hit our handler.
+MAX_UPLOAD_BYTES = 1 * 1024 * 1024 * 1024   # 1 GB
+
+# Allowed browser origins for CORS.
+# Add your GitHub Pages URL here once you have it.
 ALLOWED_ORIGINS = [
-    "http://localhost:3000",        # local dev (e.g. live-server)
-    "http://localhost:5173",        # local dev (Vite)
-    "http://127.0.0.1:5500",        # VS Code Live Server
-    "https://msalem7777.github.io",   # ← REPLACE with your actual GitHub Pages URL
-    # Add more origins as needed:
-    # "https://custom-domain.com",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5500",
+    "https://msalem7777.github.io",
 ]
 
-# Set to True to automatically run dag_sampler after receiving a DAG.
-AUTO_SAMPLE = False
-
-# Number of rows to generate when AUTO_SAMPLE is True.
-AUTO_SAMPLE_ROWS = 500
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Logging setup
+# Logging
 # ─────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -107,270 +107,473 @@ logging.basicConfig(
 log = logging.getLogger("deepdive-server")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Flask application
+# Flask app
 # ─────────────────────────────────────────────────────────────────────────────
 
-app = Flask(__name__)
+flask_app = Flask(__name__)
 
-# Apply CORS to every route.  flask-cors handles the preflight OPTIONS requests
-# automatically, which is necessary for POST from a cross-origin page.
+# Set maximum content length — Flask enforces this automatically and returns
+# 413 Request Entity Too Large if exceeded.
+flask_app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
+
 CORS(
-    app,
+    flask_app,
     origins=ALLOWED_ORIGINS,
     methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "X-Requested-With"],
 )
 
-# In-memory state shared across requests (thread-safe via a simple lock).
-_state_lock = threading.Lock()
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared in-memory state (protected by a lock for thread safety)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_lock  = threading.Lock()
 _state = {
-    "last_dag_path": None,      # Path of the most recently saved DAG file
-    "last_dag_time": None,      # ISO timestamp of last save
-    "total_received": 0,        # How many DAGs have been received this session
+    # DAG tracking
+    "last_dag_path": None,
+    "last_dag_time": None,
+    "total_dags":    0,
+
+    # Upload / analysis job tracking
+    # Only one job runs at a time (sufficient for local single-user use).
+    "job": {
+        "status":          "idle",   # "idle"|"running"|"complete"|"error"
+        "timestamp":       None,     # job timestamp string (used as folder name)
+        "dataset_path":    None,     # Path to uploaded file
+        "dag_path":        None,     # Path to associated DAG JSON
+        "response_var":    None,     # Column name of the response variable
+        "results_dir":     None,     # Path to results output folder
+        "predictions_url": None,     # Relative URL for predictions CSV download
+        "model_url":       None,     # Relative URL for model download (if requested)
+        "n_predicted":     0,        # Number of rows predicted
+        "error_msg":       None,     # Error message if status == "error"
+        "process":         None,     # subprocess.Popen handle (not serialised)
+    },
 }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: validate that a dict looks like a DAG graph
+# DAG validation helper
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _validate_dag(graph: dict) -> list[str]:
     """
-    Return a list of validation error strings.
-    Empty list means the graph is acceptable.
-
-    We do a lightweight structural check rather than a full cycle test here —
-    the web frontend already enforces acyclicity, and dag_sampler.py does a
-    topological sort that will catch any remaining issues.
+    Lightweight structural check on a graph dict.
+    Returns a list of error strings; empty list = valid.
     """
     errors = []
+    if "nodes" not in graph: errors.append("Missing 'nodes'")
+    if "edges" not in graph: errors.append("Missing 'edges'")
+    if errors: return errors
 
-    # Must have nodes and edges keys
-    if "nodes" not in graph:
-        errors.append("Missing 'nodes' key")
-    if "edges" not in graph:
-        errors.append("Missing 'edges' key")
-
-    if errors:
-        # Can't do further checks without these keys
-        return errors
-
-    nodes = graph["nodes"]
-    edges = graph["edges"]
-
-    # nodes must be a non-empty list
-    if not isinstance(nodes, list) or len(nodes) == 0:
-        errors.append("'nodes' must be a non-empty list")
-        return errors
-
-    # Every node must have an id and a name
     node_ids = set()
-    for i, n in enumerate(nodes):
+    for i, n in enumerate(graph["nodes"]):
         if not isinstance(n, dict):
-            errors.append(f"Node {i} is not a dict")
-            continue
+            errors.append(f"Node {i} is not a dict"); continue
         if "id" not in n:
             errors.append(f"Node {i} missing 'id'")
         else:
             node_ids.add(n["id"])
-        if "name" not in n or not str(n["name"]).strip():
-            errors.append(f"Node {i} missing or empty 'name'")
+        if not str(n.get("name", "")).strip():
+            errors.append(f"Node {i} missing 'name'")
 
-    # edges must be a list of [src_id, tgt_id] pairs
-    if not isinstance(edges, list):
-        errors.append("'edges' must be a list")
-    else:
-        for j, e in enumerate(edges):
-            if not (isinstance(e, list) and len(e) == 2):
-                errors.append(f"Edge {j} must be [src_id, tgt_id]")
-            else:
-                src, tgt = e
-                if src not in node_ids:
-                    errors.append(f"Edge {j} src={src} is not a known node id")
-                if tgt not in node_ids:
-                    errors.append(f"Edge {j} tgt={tgt} is not a known node id")
+    for j, e in enumerate(graph.get("edges", [])):
+        if not (isinstance(e, list) and len(e) == 2):
+            errors.append(f"Edge {j} must be [src_id, tgt_id]")
+        else:
+            if e[0] not in node_ids: errors.append(f"Edge {j} src={e[0]} unknown")
+            if e[1] not in node_ids: errors.append(f"Edge {j} tgt={e[1]} unknown")
 
     return errors
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: run dag_sampler in a background thread
+# Analysis job runner
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _auto_sample_background(dag_path: Path, n_rows: int) -> None:
+def _run_analysis(
+    dataset_path: Path,
+    dag_path:     Path,
+    response_var: str,
+    results_dir:  Path,
+    timestamp:    str,
+) -> None:
     """
-    Attempt to import and run DAGSampler on the saved DAG file.
-    Runs in a daemon thread so it does not block the HTTP response.
+    Launch analyze.py as a subprocess and monitor it.
+    Updates _state["job"] throughout.
+
+    This function runs in a daemon thread so it never blocks HTTP responses.
+
+    CONTRACT with analyze.py:
+    ─────────────────────────
+    The script is called with:
+        python analyze.py
+            --input    <dataset_path>
+            --response <response_var>
+            --dag      <dag_path>
+            --output   <results_dir>
+
+    It must write to <results_dir>:
+        predictions.csv   — rows where response was missing + predicted values
+        status.json       — { "status": "complete"|"error",
+                               "n_predicted": <int>,
+                               "response": "<col>",
+                               "message": "<optional human-readable note>" }
+
+    If the user requested the model (future feature), the script also writes:
+        model.pt          — serialised PyTorch model (TorchScript format)
     """
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    with _lock:
+        _state["job"]["status"]      = "running"
+        _state["job"]["results_dir"] = str(results_dir)
+
+    log.info(f"Starting analysis job {timestamp}")
+    log.info(f"  Dataset  : {dataset_path}")
+    log.info(f"  Response : {response_var}")
+    log.info(f"  DAG      : {dag_path}")
+    log.info(f"  Output   : {results_dir}")
+
     try:
-        log.info(f"AUTO_SAMPLE: generating {n_rows} rows from {dag_path.name} …")
-        sys.path.insert(0, str(dag_path.parent))  # ensure dag_sampler is findable
-        from dag_sampler import DAGSampler          # type: ignore
+        cmd = [
+            sys.executable,          # same Python interpreter running this server
+            str(ANALYZE_SCRIPT),
+            "--input",    str(dataset_path),
+            "--response", response_var,
+            "--dag",      str(dag_path),
+            "--output",   str(results_dir),
+        ]
 
-        sampler = DAGSampler.from_file(dag_path)
-        df = sampler.sample_dataset(n_rows=n_rows, seed=42)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
 
-        # Save alongside the DAG file
-        csv_path = dag_path.with_suffix(".csv")
-        try:
-            df.to_csv(csv_path, index=False)
-            log.info(f"AUTO_SAMPLE: saved → {csv_path}")
-        except AttributeError:
-            # pandas not available; df is a plain dict
-            import csv
-            cols = list(df.keys())
-            with open(csv_path, "w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow(cols)
-                for row in zip(*[df[c] for c in cols]):
-                    w.writerow(row)
-            log.info(f"AUTO_SAMPLE: saved (csv module) → {csv_path}")
+        with _lock:
+            _state["job"]["process"] = proc
+
+        # Stream subprocess output to our log
+        for line in proc.stdout:
+            log.info(f"  [analyze] {line.rstrip()}")
+
+        proc.wait()
+
+        # ── Read status.json written by analyze.py ────────────────────────
+        status_file = results_dir / "status.json"
+        if status_file.exists():
+            with open(status_file) as f:
+                job_result = json.load(f)
+        else:
+            # analyze.py didn't write a status file — treat as error
+            job_result = {
+                "status":      "error",
+                "n_predicted": 0,
+                "message":     "analyze.py did not write a status.json file.",
+            }
+
+        predictions_path = results_dir / "predictions.csv"
+        model_path       = results_dir / "model.pt"
+
+        with _lock:
+            _state["job"]["status"]      = job_result.get("status", "error")
+            _state["job"]["n_predicted"] = job_result.get("n_predicted", 0)
+            _state["job"]["error_msg"]   = job_result.get("message") if job_result.get("status") == "error" else None
+            _state["job"]["process"]     = None
+
+            # Build download URLs if files exist
+            if predictions_path.exists():
+                _state["job"]["predictions_url"] = f"/download/{timestamp}/predictions.csv"
+            if model_path.exists():
+                _state["job"]["model_url"] = f"/download/{timestamp}/model.pt"
+
+        log.info(f"Analysis job {timestamp} → {job_result.get('status')}")
 
     except Exception as exc:
-        log.error(f"AUTO_SAMPLE failed: {exc}")
+        log.error(f"Analysis job {timestamp} crashed: {exc}")
+        with _lock:
+            _state["job"]["status"]    = "error"
+            _state["job"]["error_msg"] = str(exc)
+            _state["job"]["process"]   = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Routes
+# Routes — health + key
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.route("/status", methods=["GET"])
+@flask_app.route("/status", methods=["GET"])
 def status():
-    """
-    Simple health-check endpoint.
-    The web frontend pings this on load to confirm the local server is running.
-    Returns 200 + a JSON object with server metadata.
-    """
-    with _state_lock:
+    """Health check — returns server state and current job status."""
+    with _lock:
+        job = {k: v for k, v in _state["job"].items() if k != "process"}
         return jsonify({
-            "ok": True,
-            "server": "deepdive-local-server",
-            "version": "1.0.0",
-            "total_received": _state["total_received"],
+            "ok":            True,
+            "server":        "deepdive-local-server",
+            "version":       "2.0.0",
+            "total_dags":    _state["total_dags"],
             "last_dag_time": _state["last_dag_time"],
+            "job":           job,
         })
 
 
-@app.route("/gemini_key", methods=["GET"])
+@flask_app.route("/gemini_key", methods=["GET"])
 def gemini_key():
     """
-    Returns the Gemini API key from the GEMINI_API_KEY environment variable.
-
-    SECURITY: This endpoint is only useful when called from localhost because
-    the CORS policy restricts it to the ALLOWED_ORIGINS list above.  The key
-    is never logged and never forwarded — the browser calls Gemini directly.
-
-    If the key is not set, returns a 404 so the frontend can show a helpful
-    error message rather than silently failing.
+    Return the LLM API key from the GEMINI_API_KEY environment variable.
+    Only reachable from localhost (CORS restricts cross-origin access).
     """
     key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not key:
-        # Return 404 with a descriptive message
         return jsonify({
-            "error": "GEMINI_API_KEY environment variable is not set.",
+            "error": "GEMINI_API_KEY not set.",
             "hint": (
-                "Windows PowerShell: $env:GEMINI_API_KEY = 'your-key-here'\n"
-                "Windows CMD:        set GEMINI_API_KEY=your-key-here\n"
-                "Linux/macOS:        export GEMINI_API_KEY=your-key-here"
+                "Windows PowerShell: $env:GEMINI_API_KEY = 'your-key'\n"
+                "Linux/macOS:        export GEMINI_API_KEY=your-key"
             ),
         }), 404
-
-    # Only return the key — nothing else
     return jsonify({"key": key})
 
 
-@app.route("/dag", methods=["POST", "OPTIONS"])
+# ─────────────────────────────────────────────────────────────────────────────
+# Routes — DAG
+# ─────────────────────────────────────────────────────────────────────────────
+
+@flask_app.route("/dag", methods=["POST", "OPTIONS"])
 def receive_dag():
     """
-    Main endpoint: receive a DAG JSON payload from the web frontend.
-
-    Expected request body (application/json):
-    {
-        "nodes":     [ { "id": 1, "name": "Rain", "emoji": "🌧️", ... }, ... ],
-        "edges":     [ [1, 2], [1, 3], ... ],
-        "leaf_ids":  [3, 4],
-        "root_ids":  [1],
-        "parents":   { "2": [1], "3": [1] },
-        "var_types": { "1": "continuous", ... },
-        "levels":    {}
-    }
-
-    On success: saves the graph as a timestamped JSON file and returns 200.
-    On failure: returns 400 with a list of validation errors.
+    Receive a DAG JSON from the web frontend, validate, and save it.
+    Body: application/json matching the DeepDive graph schema.
     """
-    # Flask + flask-cors handle OPTIONS (preflight) automatically.
-    # This branch is here as a safety net only.
     if request.method == "OPTIONS":
         return "", 204
 
-    # ── Parse JSON body ────────────────────────────────────────────────────
     if not request.is_json:
         return jsonify({"error": "Content-Type must be application/json"}), 400
 
     try:
         graph = request.get_json(force=True)
-    except Exception as exc:
-        return jsonify({"error": f"JSON parse error: {exc}"}), 400
+    except Exception as e:
+        return jsonify({"error": f"JSON parse error: {e}"}), 400
 
-    if not isinstance(graph, dict):
-        return jsonify({"error": "Payload must be a JSON object (dict)"}), 400
-
-    # ── Validate ──────────────────────────────────────────────────────────
     errors = _validate_dag(graph)
     if errors:
-        log.warning(f"Rejected DAG — {len(errors)} validation error(s): {errors}")
         return jsonify({"error": "Invalid DAG", "details": errors}), 400
 
-    # ── Save to disk ──────────────────────────────────────────────────────
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Timestamped filename so multiple submissions don't overwrite each other
+    DAG_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = OUTPUT_DIR / f"dag_{timestamp}.json"
+    dag_path  = DAG_DIR / f"dag_{timestamp}.json"
 
-    with open(filename, "w", encoding="utf-8") as f:
+    with open(dag_path, "w", encoding="utf-8") as f:
         json.dump(graph, f, indent=2, ensure_ascii=False)
 
-    log.info(
-        f"Saved DAG → {filename}  "
-        f"({len(graph['nodes'])} nodes, {len(graph['edges'])} edges)"
-    )
+    log.info(f"DAG saved → {dag_path}  ({len(graph['nodes'])} nodes, {len(graph['edges'])} edges)")
 
-    # ── Update shared state ────────────────────────────────────────────────
-    with _state_lock:
-        _state["last_dag_path"] = str(filename)
+    with _lock:
+        _state["last_dag_path"] = str(dag_path)
         _state["last_dag_time"] = datetime.now().isoformat()
-        _state["total_received"] += 1
-
-    # ── Optionally trigger sampler ─────────────────────────────────────────
-    if AUTO_SAMPLE:
-        t = threading.Thread(
-            target=_auto_sample_background,
-            args=(filename, AUTO_SAMPLE_ROWS),
-            daemon=True,  # dies when main process exits
-        )
-        t.start()
+        _state["total_dags"]   += 1
 
     return jsonify({
-        "ok": True,
-        "saved_to": str(filename),
-        "nodes": len(graph["nodes"]),
-        "edges": len(graph["edges"]),
+        "ok":       True,
+        "saved_to": str(dag_path),
+        "nodes":    len(graph["nodes"]),
+        "edges":    len(graph["edges"]),
     })
 
 
-@app.route("/result", methods=["GET"])
+@flask_app.route("/result", methods=["GET"])
 def result():
-    """
-    Lets the frontend poll for the path of the most recently saved DAG.
-    Useful for UX feedback ("your DAG was saved to dag_outputs/dag_20240510_143201.json").
-    """
-    with _state_lock:
+    """Return the path of the most recently saved DAG."""
+    with _lock:
         return jsonify({
             "last_dag_path": _state["last_dag_path"],
             "last_dag_time": _state["last_dag_time"],
-            "total_received": _state["total_received"],
+            "total_dags":    _state["total_dags"],
         })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routes — dataset upload
+# ─────────────────────────────────────────────────────────────────────────────
+
+@flask_app.route("/upload", methods=["POST", "OPTIONS"])
+def upload_dataset():
+    """
+    Receive a dataset file + DAG metadata from the browser.
+
+    Expected multipart/form-data fields:
+        file              — the CSV or XLSX file (binary)
+        dag               — DAG JSON string
+        response_variable — column name of the response variable (string)
+
+    Workflow:
+        1. Save the file  to datasets/<timestamp>_<filename>
+        2. Save the DAG   to dag_outputs/<timestamp>.json
+        3. Launch analyze.py in a background thread
+        4. Return 202 Accepted immediately
+    """
+    if request.method == "OPTIONS":
+        return "", 204
+
+    # ── Validate file field ───────────────────────────────────────────────
+    if "file" not in request.files:
+        return jsonify({"error": "No file field in request."}), 400
+
+    uploaded_file = request.files["file"]
+    if not uploaded_file.filename:
+        return jsonify({"error": "Empty filename."}), 400
+
+    # ── Validate response variable ────────────────────────────────────────
+    response_var = request.form.get("response_variable", "").strip()
+    if not response_var:
+        return jsonify({"error": "response_variable field is required."}), 400
+
+    # ── Parse DAG (optional — a DAG may not be built yet) ─────────────────
+    dag_json_str = request.form.get("dag", "")
+    graph        = None
+    dag_path     = None
+
+    if dag_json_str:
+        try:
+            graph = json.loads(dag_json_str)
+        except json.JSONDecodeError:
+            return jsonify({"error": "dag field is not valid JSON."}), 400
+
+        errors = _validate_dag(graph)
+        if errors:
+            return jsonify({"error": "Invalid DAG", "details": errors}), 400
+
+    # ── Generate a shared timestamp for this job ──────────────────────────
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # ── Save dataset file ─────────────────────────────────────────────────
+    DATASET_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Sanitise filename — strip path components, replace spaces
+    safe_name    = Path(uploaded_file.filename).name.replace(" ", "_")
+    dataset_path = DATASET_DIR / f"{timestamp}_{safe_name}"
+    uploaded_file.save(str(dataset_path))
+
+    log.info(f"Dataset saved → {dataset_path}  ({dataset_path.stat().st_size:,} bytes)")
+
+    # ── Save DAG alongside the dataset ────────────────────────────────────
+    if graph:
+        DAG_DIR.mkdir(parents=True, exist_ok=True)
+        dag_path = DAG_DIR / f"dag_{timestamp}.json"
+        with open(dag_path, "w", encoding="utf-8") as f:
+            json.dump(graph, f, indent=2, ensure_ascii=False)
+        log.info(f"DAG saved → {dag_path}")
+
+        with _lock:
+            _state["last_dag_path"] = str(dag_path)
+            _state["last_dag_time"] = datetime.now().isoformat()
+            _state["total_dags"]   += 1
+
+    # ── Reset job state and launch analysis in background ─────────────────
+    results_dir = RESULTS_DIR / timestamp
+
+    with _lock:
+        _state["job"] = {
+            "status":          "running",
+            "timestamp":       timestamp,
+            "dataset_path":    str(dataset_path),
+            "dag_path":        str(dag_path) if dag_path else None,
+            "response_var":    response_var,
+            "results_dir":     str(results_dir),
+            "predictions_url": None,
+            "model_url":       None,
+            "n_predicted":     0,
+            "error_msg":       None,
+            "process":         None,
+        }
+
+    # Check analyze.py exists before launching
+    if not ANALYZE_SCRIPT.exists():
+        log.warning(f"analyze.py not found at {ANALYZE_SCRIPT.resolve()} — job marked as error.")
+        with _lock:
+            _state["job"]["status"]    = "error"
+            _state["job"]["error_msg"] = (
+                f"analyze.py not found. Place it at {ANALYZE_SCRIPT.resolve()}"
+            )
+        return jsonify({
+            "ok":        False,
+            "error":     "analyze.py not found on server.",
+            "timestamp": timestamp,
+        }), 500
+
+    thread = threading.Thread(
+        target=_run_analysis,
+        args=(dataset_path, dag_path or Path(""), response_var, results_dir, timestamp),
+        daemon=True,
+    )
+    thread.start()
+
+    log.info(f"Analysis job {timestamp} started for response='{response_var}'")
+
+    # Return 202 Accepted — the browser will poll /upload_status
+    return jsonify({
+        "ok":          True,
+        "accepted":    True,
+        "timestamp":   timestamp,
+        "dataset":     str(dataset_path),
+        "response_var": response_var,
+        "message":     "Dataset received. Analysis started.",
+    }), 202
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routes — job status polling
+# ─────────────────────────────────────────────────────────────────────────────
+
+@flask_app.route("/upload_status", methods=["GET"])
+def upload_status():
+    """
+    Poll for the status of the current analysis job.
+
+    Returns:
+        status          — "idle" | "running" | "complete" | "error"
+        n_predicted     — number of rows predicted (available when complete)
+        predictions_url — relative URL for downloading predictions.csv
+        model_url       — relative URL for downloading model.pt (if present)
+        error_msg       — error description (if status == "error")
+    """
+    with _lock:
+        job = {k: v for k, v in _state["job"].items() if k != "process"}
+    return jsonify(job)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routes — file downloads
+# ─────────────────────────────────────────────────────────────────────────────
+
+@flask_app.route("/download/<timestamp>/<filename>", methods=["GET"])
+def download_file(timestamp: str, filename: str):
+    """
+    Serve a file from results/<timestamp>/<filename>.
+
+    Allowed filenames: predictions.csv, model.pt
+    The timestamp path component prevents directory traversal attacks.
+    """
+    # Whitelist allowed filenames
+    ALLOWED_FILES = {"predictions.csv", "model.pt"}
+    if filename not in ALLOWED_FILES:
+        return jsonify({"error": f"File '{filename}' is not available for download."}), 403
+
+    # Sanitise timestamp — only allow alphanumeric and underscores
+    safe_ts = "".join(c for c in timestamp if c.isalnum() or c == "_")
+    file_path = RESULTS_DIR / safe_ts / filename
+
+    if not file_path.exists():
+        return jsonify({"error": f"File not found: {file_path}"}), 404
+
+    log.info(f"Serving download: {file_path}")
+    return send_file(
+        str(file_path.resolve()),
+        as_attachment=True,
+        download_name=filename,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -378,75 +581,57 @@ def result():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="DeepDive local bridge server",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "--port", "-p",
-        type=int,
-        default=DEFAULT_PORT,
-        help=f"Port to listen on (default: {DEFAULT_PORT})",
-    )
-    parser.add_argument(
-        "--output-dir", "-o",
-        type=str,
-        default=str(OUTPUT_DIR),
-        help=f"Directory to save received DAG JSON files (default: {OUTPUT_DIR})",
-    )
-    parser.add_argument(
-        "--auto-sample",
-        action="store_true",
-        default=AUTO_SAMPLE,
-        help="Automatically run dag_sampler after each received DAG",
-    )
-    parser.add_argument(
-        "--sample-rows",
-        type=int,
-        default=AUTO_SAMPLE_ROWS,
-        help=f"Rows to generate when --auto-sample is set (default: {AUTO_SAMPLE_ROWS})",
-    )
+    parser = argparse.ArgumentParser(description="DeepDive local bridge server v2")
+    parser.add_argument("--port", "-p", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--output-dir", type=str, default=str(DAG_DIR))
+    parser.add_argument("--dataset-dir", type=str, default=str(DATASET_DIR))
+    parser.add_argument("--results-dir", type=str, default=str(RESULTS_DIR))
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
 
-    # Apply CLI overrides to module-level config variables
-    global OUTPUT_DIR, AUTO_SAMPLE, AUTO_SAMPLE_ROWS
-    OUTPUT_DIR = Path(args.output_dir)
-    AUTO_SAMPLE = args.auto_sample
-    AUTO_SAMPLE_ROWS = args.sample_rows
+    global DAG_DIR, DATASET_DIR, RESULTS_DIR
+    DAG_DIR     = Path(args.output_dir)
+    DATASET_DIR = Path(args.dataset_dir)
+    RESULTS_DIR = Path(args.results_dir)
 
-    # Print a clear startup banner so users know the server is running
+    # Create directories (datasets/ is gitignored — create it locally)
+    for d in [DAG_DIR, DATASET_DIR, RESULTS_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
     print()
     print("  ╔══════════════════════════════════════════════════════╗")
-    print("  ║         DeepDive — Local Bridge Server  v1.0.0      ║")
+    print("  ║       DeepDive — Local Bridge Server  v2.0.0        ║")
     print("  ╚══════════════════════════════════════════════════════╝")
     print()
-    print(f"  Listening on  :  http://localhost:{args.port}")
-    print(f"  Saving DAGs to:  {OUTPUT_DIR.resolve()}")
-    print(f"  Auto-sample   :  {'ON (' + str(AUTO_SAMPLE_ROWS) + ' rows)' if AUTO_SAMPLE else 'OFF'}")
+    print(f"  Listening on   :  http://localhost:{args.port}")
+    print(f"  DAG outputs    :  {DAG_DIR.resolve()}")
+    print(f"  Datasets       :  {DATASET_DIR.resolve()}  (gitignored)")
+    print(f"  Results        :  {RESULTS_DIR.resolve()}")
+    print(f"  Analysis script:  {ANALYZE_SCRIPT.resolve()}")
+    print(f"  Max upload     :  {MAX_UPLOAD_BYTES // (1024**3)} GB")
     print()
 
-    # Warn if Gemini key is not set
     if not os.environ.get("GEMINI_API_KEY"):
-        print("  ⚠  GEMINI_API_KEY not set — LLM features will be unavailable.")
-        print("     Set it with:  $env:GEMINI_API_KEY = 'your-key-here'  (PowerShell)")
+        print("  ⚠  GEMINI_API_KEY not set — LLM key endpoint will return 404.")
+        print()
+
+    if not ANALYZE_SCRIPT.exists():
+        print(f"  ⚠  analyze.py not found — uploads will fail until it is placed here.")
         print()
 
     print("  Allowed origins:")
-    for origin in ALLOWED_ORIGINS:
-        print(f"    • {origin}")
+    for o in ALLOWED_ORIGINS:
+        print(f"    • {o}")
     print()
     print("  Press Ctrl+C to stop.\n")
 
-    # Start Flask.  use_reloader=False is important — the reloader spawns a
-    # second process which breaks the threading.Lock and confuses the state dict.
-    app.run(
-        host="127.0.0.1",   # only accept connections from localhost
+    flask_app.run(
+        host="127.0.0.1",
         port=args.port,
-        debug=False,        # keep False in production; set True for dev tracing
+        debug=False,
         use_reloader=False,
     )
 

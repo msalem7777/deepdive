@@ -3,32 +3,27 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>DeepDive — Causal Graph Editor</title>
+  <title>DeepDive — Cause & Effect Mapper</title>
 
   <!--
     DeepDive  |  index.html
     ═══════════════════════════════════════════════════════════════════════════
-    Three-column single-page application:
-      [Left sidebar]  [Canvas]  [LLM chat panel]
+    Three-column layout: [Left sidebar] [Canvas] [AI chat panel]
 
-    The LLM panel is always visible and collapsible.
-    Onboarding conversation fires on every page load.
-    Rich hover tooltips on every toolbar button.
-    Emoji is assigned automatically by the LLM when a node is named.
-
-    Scripts (loaded at bottom, order matters):
-      gemini_bridge.js  → window.DeepDiveLLM
-      dag_editor.js     → window.DAGEditor, window.VAR_TYPES
-      (inline bootstrap below)
+    External dependencies:
+      • Google Fonts (cosmetic only — app works without them)
+      • SheetJS (XLSX parsing) — loaded from CDN
+      • gemini_bridge.js — LLM bridge
+      • dag_editor.js    — canvas editor
     ═══════════════════════════════════════════════════════════════════════════
   -->
 
+  <!-- SheetJS for XLSX parsing — loaded before our scripts -->
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link
-    href="https://fonts.googleapis.com/css2?family=Courier+Prime:ital,wght@0,400;0,700;1,400&family=Share+Tech+Mono&display=swap"
-    rel="stylesheet"
-  />
+  <link href="https://fonts.googleapis.com/css2?family=Courier+Prime:ital,wght@0,400;0,700;1,400&family=Share+Tech+Mono&display=swap" rel="stylesheet" />
 
   <style>
     /* ════════════════════════════════════════════════════════════════════════
@@ -41,7 +36,6 @@
       --bg-hover:       #252c40;
       --border:         #2a3348;
       --border-dim:     #1e2435;
-
       --amber:          #f59e0b;
       --amber-dim:      #92400e;
       --amber-glow:     rgba(245,158,11,0.14);
@@ -52,29 +46,24 @@
       --purple:         #7c3aed;
       --purple-dim:     #4c1d95;
       --purple-glow:    rgba(124,58,237,0.15);
-
+      --teal:           #14b8a6;
+      --teal-dim:       #0f766e;
+      --teal-glow:      rgba(20,184,166,0.14);
       --text-main:      #f1f5f9;
       --text-dim:       #64748b;
       --text-muted:     #374151;
-
       --font-mono:      "Courier Prime", "Courier New", monospace;
       --font-tech:      "Share Tech Mono", "Courier New", monospace;
-
       --left-w:         260px;
-      --right-w:        320px;
+      --right-w:        330px;
       --right-w-collapsed: 36px;
       --toolbar-h:      50px;
       --status-h:       26px;
       --radius:         4px;
-
-      /* Tooltip */
       --tip-bg:         #1e2435;
       --tip-border:     #2a3348;
     }
 
-    /* ════════════════════════════════════════════════════════════════════════
-       RESET
-    ════════════════════════════════════════════════════════════════════════ */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
       height: 100%; overflow: hidden;
@@ -88,7 +77,6 @@
 
     /* ════════════════════════════════════════════════════════════════════════
        APP SHELL
-       toolbar-h | (left + canvas + right) | status-h
     ════════════════════════════════════════════════════════════════════════ */
     .app-shell {
       display: grid;
@@ -107,10 +95,9 @@
       background: var(--bg-panel);
       border-bottom: 1px solid var(--border);
       z-index: 30;
-      overflow: visible;   /* needed so tooltips can escape */
+      overflow: visible;
       position: relative;
     }
-
     .toolbar-logo {
       font-family: var(--font-tech);
       font-size: 15px;
@@ -120,10 +107,9 @@
       border-right: 1px solid var(--border);
       margin-right: 6px;
       white-space: nowrap;
-      position: relative;
       flex-shrink: 0;
+      position: relative;
     }
-    /* Shimmer sweep on the logo */
     .toolbar-logo::after {
       content: "";
       position: absolute; inset: 0;
@@ -136,9 +122,8 @@
       100% { background-position:  200% 0; }
     }
 
-    /* ── Generic button base ── */
     .tool-btn {
-      position: relative;   /* anchor for tooltip */
+      position: relative;
       display: flex;
       align-items: center;
       gap: 5px;
@@ -168,7 +153,6 @@
       border-radius: 2px;
       border: 1px solid var(--text-muted);
     }
-
     .toolbar-sep {
       width: 1px; height: 22px;
       background: var(--border);
@@ -176,10 +160,10 @@
       flex-shrink: 0;
     }
 
-    /* Right-side action buttons */
+    /* Action buttons (right side) */
     .action-btn {
       position: relative;
-      padding: 5px 13px;
+      padding: 5px 12px;
       border-radius: var(--radius);
       border: none;
       font-family: var(--font-mono);
@@ -191,27 +175,22 @@
       transition: filter 0.15s;
     }
     .action-btn:hover { filter: brightness(1.15); }
-    .action-btn.primary   { background: var(--amber); color: #000; margin-left: auto; }
-    .action-btn.secondary {
-      background: var(--bg-card); color: var(--text-dim);
-      border: 1px solid var(--border); margin-left: 5px;
-    }
+    .action-btn.primary   { background: var(--amber);  color: #000; margin-left: auto; }
+    .action-btn.secondary { background: var(--bg-card); color: var(--text-dim); border: 1px solid var(--border); margin-left: 4px; }
+    .action-btn.upload-btn { background: var(--teal-dim); color: #ccfbf1; border: 1px solid var(--teal); margin-left: 4px; }
+    .action-btn.upload-btn:hover { filter: brightness(1.2); }
 
     /* ════════════════════════════════════════════════════════════════════════
-       RICH HOVER TOOLTIPS
-       Each .tool-btn or .action-btn can contain a .tooltip child.
-       The tooltip appears on hover via CSS — no JS needed.
+       RICH TOOLTIPS
     ════════════════════════════════════════════════════════════════════════ */
     .tooltip {
-      /* Hidden by default */
       display: none;
       position: absolute;
       top: calc(100% + 8px);
       left: 50%;
       transform: translateX(-50%);
       z-index: 200;
-      width: 220px;          /* fixed width so text always wraps */
-      max-width: 220px;
+      width: 210px;
       background: var(--tip-bg);
       border: 1px solid var(--tip-border);
       border-radius: var(--radius);
@@ -219,70 +198,31 @@
       box-shadow: 0 8px 24px rgba(0,0,0,0.6);
       pointer-events: none;
       text-align: left;
-      /* Force text to wrap inside the box */
       white-space: normal;
       word-wrap: break-word;
-      overflow-wrap: break-word;
     }
-    /* Show on parent hover */
     .tool-btn:hover .tooltip,
     .action-btn:hover .tooltip { display: block; }
-
-    /* Keep tooltip inside viewport for buttons near the right edge */
     .tool-btn:nth-last-child(-n+4) .tooltip,
-    .action-btn .tooltip {
-      left: auto; right: 0;
-      transform: none;
-    }
-
-    .tip-title {
-      font-family: var(--font-tech);
-      font-size: 12px;
-      color: var(--amber);
-      margin-bottom: 5px;
-      letter-spacing: 0.05em;
-    }
-    .tip-body {
-      font-size: 11px;
-      color: var(--text-dim);
-      line-height: 1.6;
-    }
-    .tip-key {
-      display: inline-block;
-      margin-top: 6px;
-      font-size: 10px;
-      color: var(--text-muted);
-      background: var(--bg-base);
-      border: 1px solid var(--text-muted);
-      border-radius: 2px;
-      padding: 1px 5px;
-    }
+    .action-btn .tooltip { left: auto; right: 0; transform: none; }
+    .tip-title { font-family: var(--font-tech); font-size: 12px; color: var(--amber); margin-bottom: 5px; }
+    .tip-body  { font-size: 11px; color: var(--text-dim); line-height: 1.6; }
+    .tip-key   { display: inline-block; margin-top: 6px; font-size: 10px; color: var(--text-muted); background: var(--bg-base); border: 1px solid var(--text-muted); border-radius: 2px; padding: 1px 5px; }
 
     /* ════════════════════════════════════════════════════════════════════════
-       MAIN AREA — three columns
+       MAIN AREA
     ════════════════════════════════════════════════════════════════════════ */
-    .main-area {
-      display: flex;
-      overflow: hidden;
-      position: relative;
-    }
+    .main-area { display: flex; overflow: hidden; position: relative; }
 
-    /* ── Left sidebar ─────────────────────────────────────────────────── */
+    /* ── Left sidebar ── */
     .left-sidebar {
-      width: var(--left-w);
-      min-width: var(--left-w);
+      width: var(--left-w); min-width: var(--left-w);
       background: var(--bg-panel);
       border-right: 1px solid var(--border);
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-      flex-shrink: 0;
+      display: flex; flex-direction: column;
+      overflow: hidden; flex-shrink: 0;
     }
-
-    .sidebar-section {
-      border-bottom: 1px solid var(--border-dim);
-      padding: 10px 12px;
-    }
+    .sidebar-section { border-bottom: 1px solid var(--border-dim); padding: 10px 12px; }
     .section-title {
       font-family: var(--font-tech);
       font-size: 10px;
@@ -291,373 +231,198 @@
       text-transform: uppercase;
       margin-bottom: 7px;
     }
-
-    .stat-row {
-      display: flex;
-      justify-content: space-between;
-      margin: 2px 0;
-      font-size: 12px;
-    }
+    .stat-row { display: flex; justify-content: space-between; margin: 2px 0; font-size: 12px; }
     .stat-label { color: var(--text-dim); }
     .stat-value { font-family: var(--font-tech); color: var(--text-main); }
     .stat-value.warn { color: var(--red); }
     .stat-value.ok   { color: var(--green); }
 
-    /* Node editor panel */
-    .node-panel {
-      flex: 1;
-      overflow-y: auto;
-      padding: 10px 12px;
+    /* Dataset info strip in sidebar */
+    .dataset-strip {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border-dim);
+      font-size: 11px;
+      color: var(--teal);
+      font-family: var(--font-tech);
+      display: none;   /* shown when dataset is loaded */
     }
-    .node-panel .empty-msg {
-      font-size: 12px;
-      color: var(--text-dim);
-      font-style: italic;
-      text-align: center;
-      margin-top: 20px;
-    }
+    .dataset-strip.visible { display: block; }
+    .dataset-strip-name { font-weight: bold; }
+    .dataset-strip-cols { color: var(--text-dim); }
 
-    .field-label {
-      display: block;
-      font-size: 10px;
-      color: var(--text-dim);
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      margin: 9px 0 3px;
-    }
+    .node-panel { flex: 1; overflow-y: auto; padding: 10px 12px; }
+    .node-panel .empty-msg { font-size: 12px; color: var(--text-dim); font-style: italic; text-align: center; margin-top: 20px; }
+    .field-label { display: block; font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.1em; margin: 9px 0 3px; }
     .field-label:first-child { margin-top: 0; }
-
     .text-input, .select-input {
-      width: 100%;
-      padding: 5px 7px;
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      color: var(--text-main);
-      font-family: var(--font-mono);
-      font-size: 12px;
-      outline: none;
+      width: 100%; padding: 5px 7px;
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: var(--radius); color: var(--text-main);
+      font-family: var(--font-mono); font-size: 12px; outline: none;
       transition: border-color 0.15s;
     }
     .text-input:focus, .select-input:focus { border-color: var(--amber); }
     .select-input option { background: var(--bg-card); }
-
     .apply-btn {
-      width: 100%;
-      margin-top: 9px;
-      padding: 6px;
-      background: var(--amber-glow);
-      border: 1px solid var(--amber);
-      color: var(--amber);
-      border-radius: var(--radius);
-      font-family: var(--font-mono);
-      font-size: 12px;
-      cursor: pointer;
+      width: 100%; margin-top: 9px; padding: 6px;
+      background: var(--amber-glow); border: 1px solid var(--amber);
+      color: var(--amber); border-radius: var(--radius);
+      font-family: var(--font-mono); font-size: 12px; cursor: pointer;
       transition: background 0.15s;
     }
     .apply-btn:hover { background: rgba(245,158,11,0.25); }
 
-    /* Var type legend */
-    .legend {
-      padding: 9px 12px;
-      border-top: 1px solid var(--border-dim);
-      flex-shrink: 0;
-    }
-    .legend-row {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      margin: 3px 0;
-      font-size: 11px;
-    }
-    .legend-dot {
-      width: 9px; height: 9px;
-      border-radius: 50%;
-      flex-shrink: 0;
-    }
+    .legend { padding: 9px 12px; border-top: 1px solid var(--border-dim); flex-shrink: 0; }
+    .legend-row { display: flex; align-items: center; gap: 7px; margin: 3px 0; font-size: 11px; }
+    .legend-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
 
-    /* ── Canvas area ───────────────────────────────────────────────────── */
-    .canvas-area {
-      flex: 1;
-      overflow: hidden;
-      position: relative;
-      min-width: 0;
-    }
-    #dag-canvas {
-      display: block;
-      width: 100%;
-      height: 100%;
-    }
+    /* ── Canvas ── */
+    .canvas-area { flex: 1; overflow: hidden; position: relative; min-width: 0; }
+    #dag-canvas { display: block; width: 100%; height: 100%; }
 
     /* ════════════════════════════════════════════════════════════════════════
-       RIGHT PANEL — always-visible, collapsible LLM chat
+       RIGHT PANEL — AI chat
     ════════════════════════════════════════════════════════════════════════ */
     .right-panel {
-      width: var(--right-w);
-      min-width: var(--right-w);
+      width: var(--right-w); min-width: var(--right-w);
       background: var(--bg-panel);
       border-left: 1px solid var(--border);
-      display: flex;
-      flex-direction: column;
+      display: flex; flex-direction: column;
       flex-shrink: 0;
       transition: width 0.22s cubic-bezier(0.4,0,0.2,1),
                   min-width 0.22s cubic-bezier(0.4,0,0.2,1);
-      overflow: hidden;
-      position: relative;
+      overflow: hidden; position: relative;
     }
-    /* Collapsed state — becomes a thin strip with a toggle arrow */
-    .right-panel.collapsed {
-      width: var(--right-w-collapsed);
-      min-width: var(--right-w-collapsed);
-    }
+    .right-panel.collapsed { width: var(--right-w-collapsed); min-width: var(--right-w-collapsed); }
 
-    /* Panel header */
     .chat-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 12px;
-      height: 42px;
-      border-bottom: 1px solid var(--border);
-      flex-shrink: 0;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 12px; height: 42px;
+      border-bottom: 1px solid var(--border); flex-shrink: 0;
     }
-    .chat-header-title {
-      font-family: var(--font-tech);
-      font-size: 12px;
-      color: var(--violet);
-      letter-spacing: 0.07em;
-      white-space: nowrap;
-      overflow: hidden;
-    }
-    .chat-collapse-btn {
-      background: none;
-      border: none;
-      color: var(--text-dim);
-      font-size: 16px;
-      cursor: pointer;
-      line-height: 1;
-      flex-shrink: 0;
-      transition: color 0.15s;
-      padding: 4px;
-    }
+    .chat-header-title { font-family: var(--font-tech); font-size: 12px; color: var(--violet); letter-spacing: 0.07em; white-space: nowrap; overflow: hidden; }
+    .provider-badge { font-size: 9px; font-family: var(--font-tech); color: var(--text-muted); white-space: nowrap; margin-left: 6px; flex-shrink: 0; }
+    .chat-collapse-btn { background: none; border: none; color: var(--text-dim); font-size: 16px; cursor: pointer; padding: 4px; transition: color 0.15s; }
     .chat-collapse-btn:hover { color: var(--text-main); }
 
-    /* Provider badge */
-    .provider-badge {
-      font-size: 9px;
-      font-family: var(--font-tech);
-      color: var(--text-muted);
-      letter-spacing: 0.08em;
-      white-space: nowrap;
-      margin-left: 6px;
-      flex-shrink: 0;
-    }
+    .chat-messages { flex: 1; overflow-y: auto; padding: 12px 10px; display: flex; flex-direction: column; gap: 10px; }
 
-    /* Chat messages area */
-    .chat-messages {
-      flex: 1;
-      overflow-y: auto;
-      padding: 12px 10px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-
-    /* Individual chat bubble */
     .chat-bubble {
-      max-width: 90%;
-      padding: 9px 11px;
-      border-radius: 8px;
-      font-size: 12px;
-      line-height: 1.6;
-      word-break: break-word;
+      max-width: 92%; padding: 9px 11px; border-radius: 8px;
+      font-size: 12px; line-height: 1.6; word-break: break-word;
       animation: bubble-in 0.18s ease;
     }
-    @keyframes bubble-in {
-      from { opacity: 0; transform: translateY(6px); }
-      to   { opacity: 1; transform: translateY(0); }
-    }
-    .chat-bubble.assistant {
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      color: var(--text-main);
-      align-self: flex-start;
-      border-bottom-left-radius: 2px;
-    }
-    .chat-bubble.user {
-      background: var(--purple-dim);
-      border: 1px solid var(--purple);
-      color: #ede9fe;
-      align-self: flex-end;
-      border-bottom-right-radius: 2px;
-    }
-    /* Typing indicator — three animated dots */
-    .typing-indicator {
-      display: flex;
-      gap: 4px;
-      padding: 10px 12px;
-      background: var(--bg-card);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      border-bottom-left-radius: 2px;
-      align-self: flex-start;
-    }
-    .typing-dot {
-      width: 6px; height: 6px;
-      border-radius: 50%;
-      background: var(--text-dim);
-      animation: typing 1.2s infinite;
-    }
+    @keyframes bubble-in { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+    .chat-bubble.assistant { background: var(--bg-card); border: 1px solid var(--border); color: var(--text-main); align-self: flex-start; border-bottom-left-radius: 2px; }
+    .chat-bubble.user      { background: var(--purple-dim); border: 1px solid var(--purple); color: #ede9fe; align-self: flex-end; border-bottom-right-radius: 2px; }
+
+    .typing-indicator { display: flex; gap: 4px; padding: 10px 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; border-bottom-left-radius: 2px; align-self: flex-start; }
+    .typing-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim); animation: typing 1.2s infinite; }
     .typing-dot:nth-child(2) { animation-delay: 0.2s; }
     .typing-dot:nth-child(3) { animation-delay: 0.4s; }
-    @keyframes typing {
-      0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
-      30%            { transform: translateY(-5px); opacity: 1; }
-    }
+    @keyframes typing { 0%,60%,100% { transform:translateY(0); opacity:0.4; } 30% { transform:translateY(-5px); opacity:1; } }
 
-    /* DAG-imported notice inside chat */
-    .dag-imported-notice {
-      font-size: 11px;
-      color: var(--green);
-      font-family: var(--font-tech);
-      padding: 4px 0;
-      text-align: center;
-    }
+    .map-imported-notice { font-size: 11px; color: var(--green); font-family: var(--font-tech); padding: 4px 0; text-align: center; }
 
-    /* Onboarding Yes/No buttons */
-    .onboarding-choices {
-      display: flex;
-      gap: 8px;
-      margin-top: 6px;
-    }
+    /* Onboarding action buttons */
+    .onboarding-choices { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
     .choice-btn {
-      flex: 1;
-      padding: 7px;
-      border-radius: var(--radius);
-      font-family: var(--font-mono);
-      font-size: 12px;
-      cursor: pointer;
-      border: 1px solid var(--border);
-      background: var(--bg-card);
-      color: var(--text-dim);
+      flex: 1; min-width: 80px; padding: 7px;
+      border-radius: var(--radius); font-family: var(--font-mono); font-size: 12px;
+      cursor: pointer; border: 1px solid var(--border); background: var(--bg-card); color: var(--text-dim);
       transition: background 0.15s, border-color 0.15s, color 0.15s;
     }
-    .choice-btn.yes {
-      border-color: var(--purple);
-      color: #ddd6fe;
-      background: var(--purple-glow);
-    }
+    .choice-btn.yes  { border-color: var(--purple); color: #ddd6fe; background: var(--purple-glow); }
     .choice-btn.yes:hover { background: rgba(124,58,237,0.3); }
-    .choice-btn.no:hover  { background: var(--bg-hover); color: var(--text-main); }
+    .choice-btn.upload { border-color: var(--teal); color: #ccfbf1; background: var(--teal-glow); }
+    .choice-btn.upload:hover { background: rgba(20,184,166,0.25); }
+    .choice-btn.no:hover { background: var(--bg-hover); color: var(--text-main); }
 
-    /* Chat input area */
-    .chat-input-area {
-      border-top: 1px solid var(--border);
-      padding: 10px;
-      flex-shrink: 0;
-    }
-    .chat-input-row {
-      display: flex;
-      gap: 6px;
-      align-items: flex-end;
-    }
-    .chat-textarea {
-      flex: 1;
-      min-height: 36px;
-      max-height: 100px;
-      background: var(--bg-card);
-      border: 1px solid var(--border);
+    /* ── Drag-and-drop upload zone (inside chat) ── */
+    .upload-zone {
+      border: 2px dashed var(--teal);
       border-radius: var(--radius);
-      color: var(--text-main);
-      font-family: var(--font-mono);
+      padding: 18px 12px;
+      text-align: center;
       font-size: 12px;
-      padding: 7px 9px;
-      resize: none;
-      outline: none;
-      transition: border-color 0.15s;
-      overflow-y: auto;
+      color: var(--teal);
+      cursor: pointer;
+      margin-top: 10px;
+      transition: background 0.15s, border-color 0.15s;
+      display: none;   /* shown only when user picks "upload" */
+    }
+    .upload-zone.visible { display: block; }
+    .upload-zone.drag-over { background: var(--teal-glow); border-color: #5eead4; }
+    .upload-zone-icon { font-size: 24px; margin-bottom: 6px; }
+    .upload-zone-hint { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+
+    /* Literature search button — appears in chat after outcome is identified */
+    .lit-search-btn {
+      width: 100%; margin-top: 8px; padding: 7px;
+      background: var(--teal-glow); border: 1px solid var(--teal);
+      color: #ccfbf1; border-radius: var(--radius);
+      font-family: var(--font-mono); font-size: 12px; cursor: pointer;
+      transition: background 0.15s;
+    }
+    .lit-search-btn:hover { background: rgba(20,184,166,0.25); }
+    .lit-search-btn:disabled { opacity: 0.4; cursor: default; }
+
+    /* Chat input */
+    .chat-input-area { border-top: 1px solid var(--border); padding: 10px; flex-shrink: 0; }
+    .chat-input-row  { display: flex; gap: 6px; align-items: flex-end; }
+    .chat-textarea {
+      flex: 1; min-height: 36px; max-height: 100px;
+      background: var(--bg-card); border: 1px solid var(--border);
+      border-radius: var(--radius); color: var(--text-main);
+      font-family: var(--font-mono); font-size: 12px;
+      padding: 7px 9px; resize: none; outline: none;
+      transition: border-color 0.15s; overflow-y: auto;
     }
     .chat-textarea:focus { border-color: var(--purple); }
+    .chat-textarea::placeholder { color: var(--text-muted); }
     .chat-send-btn {
       padding: 7px 13px;
-      background: var(--purple-dim);
-      border: 1px solid var(--purple);
-      color: #ede9fe;
-      border-radius: var(--radius);
-      font-family: var(--font-mono);
-      font-size: 12px;
-      font-weight: bold;
-      cursor: pointer;
-      transition: background 0.15s;
-      flex-shrink: 0;
+      background: var(--purple-dim); border: 1px solid var(--purple);
+      color: #ede9fe; border-radius: var(--radius);
+      font-family: var(--font-mono); font-size: 12px; font-weight: bold;
+      cursor: pointer; transition: background 0.15s; flex-shrink: 0;
     }
     .chat-send-btn:hover { background: var(--purple); }
     .chat-send-btn:disabled { opacity: 0.4; cursor: default; }
 
-    /* Collapsed panel: show a vertical clickable tab on the canvas edge */
-    .collapsed-label {
-      display: none;
-    }
+    /* Collapsed re-open tab */
+    .collapsed-label { display: none; }
     .right-panel.collapsed .collapsed-label { display: block; }
     .right-panel.collapsed .chat-header,
     .right-panel.collapsed .chat-messages,
     .right-panel.collapsed .chat-input-area { visibility: hidden; }
-
-    /* The re-open tab — sits on the left edge of the collapsed strip */
     .reopen-tab {
-      display: none;   /* shown only when collapsed */
-      position: absolute;
-      /* Anchor to the left border of the right panel, vertically centred */
-      top: 50%;
-      left: -1px;
+      display: none;
+      position: absolute; top: 50%; left: -1px;
       transform: translateY(-50%);
-      background: var(--bg-panel);
-      border: 1px solid var(--border);
-      border-right: none;
-      border-radius: 6px 0 0 6px;
-      padding: 14px 6px;
-      cursor: pointer;
-      writing-mode: vertical-rl;
-      text-orientation: mixed;
-      font-family: var(--font-tech);
-      font-size: 10px;
-      letter-spacing: 0.12em;
-      color: var(--violet);
-      white-space: nowrap;
-      z-index: 10;
-      transition: background 0.15s, color 0.15s;
-      user-select: none;
+      background: var(--bg-panel); border: 1px solid var(--border);
+      border-right: none; border-radius: 6px 0 0 6px;
+      padding: 14px 6px; cursor: pointer;
+      writing-mode: vertical-rl; text-orientation: mixed;
+      font-family: var(--font-tech); font-size: 10px; letter-spacing: 0.12em;
+      color: var(--violet); white-space: nowrap; z-index: 10;
+      transition: background 0.15s, color 0.15s; user-select: none;
     }
-    .reopen-tab:hover {
-      background: var(--bg-hover);
-      color: var(--text-main);
-    }
+    .reopen-tab:hover { background: var(--bg-hover); color: var(--text-main); }
     .right-panel.collapsed .reopen-tab { display: flex; align-items: center; gap: 5px; }
 
     /* ════════════════════════════════════════════════════════════════════════
        STATUS BAR
     ════════════════════════════════════════════════════════════════════════ */
     .status-bar {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      padding: 0 12px;
-      background: var(--bg-panel);
-      border-top: 1px solid var(--border);
-      font-family: var(--font-tech);
-      font-size: 11px;
-      color: var(--text-dim);
-      overflow: hidden;
-      white-space: nowrap;
+      display: flex; align-items: center; gap: 14px; padding: 0 12px;
+      background: var(--bg-panel); border-top: 1px solid var(--border);
+      font-family: var(--font-tech); font-size: 11px; color: var(--text-dim);
+      overflow: hidden; white-space: nowrap;
     }
     .status-msg { flex: 1; overflow: hidden; text-overflow: ellipsis; }
     .status-server { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
-    .status-dot {
-      width: 7px; height: 7px;
-      border-radius: 50%;
-      background: var(--text-muted);
-      transition: background 0.3s;
-    }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-muted); transition: background 0.3s; }
     .status-dot.ok    { background: var(--green); box-shadow: 0 0 5px var(--green); }
     .status-dot.warn  { background: #fbbf24; }
     .status-dot.error { background: var(--red); }
@@ -666,82 +431,27 @@
        RENAME DIALOG
     ════════════════════════════════════════════════════════════════════════ */
     dialog {
-      border: 1px solid var(--amber);
-      border-radius: var(--radius);
-      background: var(--bg-panel);
-      color: var(--text-main);
-      padding: 0;
-      min-width: 300px;
-      max-width: 88vw;
+      border: 1px solid var(--amber); border-radius: var(--radius);
+      background: var(--bg-panel); color: var(--text-main);
+      padding: 0; min-width: 300px; max-width: 88vw;
       box-shadow: 0 0 40px rgba(245,158,11,0.18), 0 8px 32px rgba(0,0,0,0.6);
       font-family: var(--font-mono);
     }
-    dialog::backdrop {
-      background: rgba(0,0,0,0.55);
-      backdrop-filter: blur(2px);
-    }
-    .dialog-header {
-      padding: 12px 14px;
-      border-bottom: 1px solid var(--border);
-      font-family: var(--font-tech);
-      font-size: 13px;
-      color: var(--amber);
-      letter-spacing: 0.05em;
-    }
+    dialog::backdrop { background: rgba(0,0,0,0.55); backdrop-filter: blur(2px); }
+    .dialog-header { padding: 12px 14px; border-bottom: 1px solid var(--border); font-family: var(--font-tech); font-size: 13px; color: var(--amber); }
     .dialog-body { padding: 14px; }
-    .dialog-footer {
-      padding: 9px 14px;
-      border-top: 1px solid var(--border);
-      display: flex;
-      justify-content: flex-end;
-      gap: 8px;
-    }
-    .dialog-btn {
-      padding: 5px 14px;
-      border-radius: var(--radius);
-      border: 1px solid var(--border);
-      font-family: var(--font-mono);
-      font-size: 12px;
-      cursor: pointer;
-      background: var(--bg-card);
-      color: var(--text-dim);
-    }
-    .dialog-btn.confirm {
-      background: var(--amber);
-      border-color: var(--amber);
-      color: #000;
-      font-weight: bold;
-    }
+    .dialog-footer { padding: 9px 14px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
+    .dialog-btn { padding: 5px 14px; border-radius: var(--radius); border: 1px solid var(--border); font-family: var(--font-mono); font-size: 12px; cursor: pointer; background: var(--bg-card); color: var(--text-dim); }
+    .dialog-btn.confirm { background: var(--amber); border-color: var(--amber); color: #000; font-weight: bold; }
     .dialog-btn:hover { filter: brightness(1.1); }
-    .name-error { font-size: 11px; color: var(--red); margin-top: 4px; min-height: 15px; }
+    .name-error  { font-size: 11px; color: var(--red); margin-top: 4px; min-height: 15px; }
     .dialog-hint { font-size: 11px; color: var(--text-dim); margin-top: 6px; }
 
     /* ════════════════════════════════════════════════════════════════════════
        TOASTS
     ════════════════════════════════════════════════════════════════════════ */
-    .toast-container {
-      position: fixed;
-      bottom: 36px; right: 14px;
-      z-index: 100;
-      display: flex;
-      flex-direction: column;
-      gap: 7px;
-      pointer-events: none;
-    }
-    .toast {
-      padding: 9px 14px;
-      border-radius: var(--radius);
-      font-size: 12px;
-      font-family: var(--font-tech);
-      max-width: 300px;
-      opacity: 0;
-      transform: translateY(8px);
-      animation: toast-in 0.2s forwards, toast-out 0.3s 3s forwards;
-      border-left: 3px solid var(--amber);
-      background: var(--bg-panel);
-      color: var(--text-main);
-      box-shadow: 0 4px 18px rgba(0,0,0,0.5);
-    }
+    .toast-container { position: fixed; bottom: 36px; right: 14px; z-index: 100; display: flex; flex-direction: column; gap: 7px; pointer-events: none; }
+    .toast { padding: 9px 14px; border-radius: var(--radius); font-size: 12px; font-family: var(--font-tech); max-width: 300px; opacity: 0; transform: translateY(8px); animation: toast-in 0.2s forwards, toast-out 0.3s 3s forwards; border-left: 3px solid var(--amber); background: var(--bg-panel); color: var(--text-main); box-shadow: 0 4px 18px rgba(0,0,0,0.5); }
     .toast.ok    { border-color: var(--green); }
     .toast.error { border-color: var(--red); }
     .toast.warn  { border-color: #fbbf24; }
@@ -749,62 +459,198 @@
     @keyframes toast-out { to { opacity:0; transform:translateY(-5px); } }
 
     /* ════════════════════════════════════════════════════════════════════════
-       SCROLLBARS
+       TAB BAR — Map / Results tabs above the canvas
     ════════════════════════════════════════════════════════════════════════ */
-    ::-webkit-scrollbar { width: 5px; }
-    ::-webkit-scrollbar-track { background: var(--bg-base); }
-    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-    ::-webkit-scrollbar-thumb:hover { background: var(--amber-dim); }
+    .tab-bar {
+      display: flex;
+      align-items: center;
+      gap: 0;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      padding: 0 12px;
+      height: 36px;
+      flex-shrink: 0;
+    }
+    .tab-btn {
+      padding: 0 18px;
+      height: 100%;
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      font-family: var(--font-tech);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      color: var(--text-dim);
+      cursor: pointer;
+      text-transform: uppercase;
+      transition: color 0.15s, border-color 0.15s;
+      white-space: nowrap;
+    }
+    .tab-btn:hover { color: var(--text-main); }
+    .tab-btn.active { color: var(--amber); border-bottom-color: var(--amber); }
+
+    /* Analysis status badge next to Results tab */
+    .tab-badge {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 1px 6px;
+      border-radius: 8px;
+      font-size: 9px;
+      font-family: var(--font-tech);
+      vertical-align: middle;
+      background: var(--bg-card);
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+    }
+    .tab-badge.running  { background: rgba(245,158,11,0.15); color: var(--amber);  border-color: var(--amber-dim); }
+    .tab-badge.complete { background: rgba(52,211,153,0.12); color: var(--green);  border-color: #065f46; }
+    .tab-badge.error    { background: rgba(239,68,68,0.12);  color: var(--red);    border-color: #7f1d1d; }
+
+    /* ════════════════════════════════════════════════════════════════════════
+       RESULTS PANEL — replaces canvas when Results tab is active
+    ════════════════════════════════════════════════════════════════════════ */
+    .results-panel {
+      display: none;   /* shown via JS when Results tab is active */
+      flex: 1;
+      flex-direction: column;
+      overflow: hidden;
+      background: var(--bg-base);
+    }
+    .results-panel.visible { display: flex; }
+
+    /* Results toolbar — download buttons */
+    .results-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 14px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .results-info {
+      font-family: var(--font-tech);
+      font-size: 11px;
+      color: var(--text-dim);
+      flex: 1;
+    }
+    .download-btn {
+      padding: 5px 12px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      background: var(--bg-card);
+      color: var(--text-dim);
+      font-family: var(--font-mono);
+      font-size: 11px;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-block;
+      transition: background 0.15s, color 0.15s;
+    }
+    .download-btn:hover { background: var(--bg-hover); color: var(--text-main); }
+    .download-btn.primary { background: var(--amber-glow); border-color: var(--amber); color: var(--amber); }
+
+    /* Scrollable table */
+    .results-table-wrap {
+      flex: 1;
+      overflow: auto;
+      padding: 14px;
+    }
+    .results-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--font-mono);
+      font-size: 12px;
+    }
+    .results-table th {
+      position: sticky;
+      top: 0;
+      background: var(--bg-panel);
+      border-bottom: 2px solid var(--amber-dim);
+      padding: 8px 12px;
+      text-align: left;
+      font-family: var(--font-tech);
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .results-table th.pred-col { color: var(--amber); border-bottom-color: var(--amber); }
+    .results-table td {
+      padding: 6px 12px;
+      border-bottom: 1px solid var(--border-dim);
+      color: var(--text-main);
+      white-space: nowrap;
+    }
+    .results-table td.pred-val { color: var(--amber); font-weight: bold; font-family: var(--font-tech); }
+    .results-table tr:hover td { background: var(--bg-card); }
+
+    /* Empty / loading state inside results panel */
+    .results-empty {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      color: var(--text-dim);
+      font-family: var(--font-tech);
+      font-size: 12px;
+      text-align: center;
+    }
+    .results-empty-icon { font-size: 36px; opacity: 0.4; }
+    .results-spinner {
+      width: 28px; height: 28px;
+      border: 3px solid var(--border);
+      border-top-color: var(--amber);
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
-
 <div class="app-shell">
 
-  <!-- ══════════════════════════════════════════════════════════════════════
+  <!-- ═══════════════════════════════════════════════════════════════════════
        TOOLBAR
-  ═══════════════════════════════════════════════════════════════════════ -->
+  ════════════════════════════════════════════════════════════════════════ -->
   <div class="toolbar">
     <span class="toolbar-logo">⬡ DEEPDIVE</span>
 
-    <!-- ── Mode buttons ── -->
-
     <button class="tool-btn active" id="btn-select" onclick="appSetMode('select')">
-      ✦ Select
-      <span class="key-hint">S</span>
+      ✦ Select <span class="key-hint">S</span>
       <div class="tooltip">
         <div class="tip-title">Select &amp; Move</div>
-        <div class="tip-body">Click a node to select it and view its properties in the sidebar. Drag to reposition it on the canvas.</div>
+        <div class="tip-body">Click a factor to select it and see its details in the sidebar. Drag it to move it around the canvas.</div>
         <div class="tip-key">S</div>
       </div>
     </button>
 
     <button class="tool-btn" id="btn-add-node" onclick="appSetMode('add_node')">
-      ＋ Node
-      <span class="key-hint">N</span>
+      ＋ Factor <span class="key-hint">N</span>
       <div class="tooltip">
-        <div class="tip-title">Add Node</div>
-        <div class="tip-body">Click anywhere on the canvas to place a new node. A dialog will appear immediately asking you to name it. The LLM will automatically assign an emoji.</div>
+        <div class="tip-title">Add a Factor</div>
+        <div class="tip-body">Click anywhere on the canvas to place a new factor. You'll be asked to name it right away. An emoji will be picked automatically.</div>
         <div class="tip-key">N</div>
       </div>
     </button>
 
     <button class="tool-btn" id="btn-add-edge" onclick="appSetMode('add_edge')">
-      → Edge
-      <span class="key-hint">E</span>
+      → Connect <span class="key-hint">E</span>
       <div class="tooltip">
-        <div class="tip-title">Draw Edge</div>
-        <div class="tip-body">Click a source node, then click a target node to draw a directed causal edge between them. Cycles are automatically rejected to keep the graph a valid DAG.</div>
+        <div class="tip-title">Draw a Connection</div>
+        <div class="tip-body">Click a source factor, then click a target factor to draw an arrow showing that the first influences the second. Feedback loops are automatically prevented.</div>
         <div class="tip-key">E</div>
       </div>
     </button>
 
     <button class="tool-btn" id="btn-delete" onclick="appSetMode('delete')">
-      ✕ Delete
-      <span class="key-hint">D</span>
+      ✕ Remove <span class="key-hint">D</span>
       <div class="tooltip">
-        <div class="tip-title">Delete</div>
-        <div class="tip-body">Click a node to remove it and all its connected edges. Click directly on an edge line to remove just that edge.</div>
+        <div class="tip-title">Remove a Factor or Connection</div>
+        <div class="tip-body">Click a factor to remove it and all its connections. Click directly on an arrow to remove just that connection.</div>
         <div class="tip-key">D  or  Del</div>
       </div>
     </button>
@@ -812,31 +658,28 @@
     <div class="toolbar-sep"></div>
 
     <button class="tool-btn" onclick="app.undo()">
-      ↩ Undo
-      <span class="key-hint">⌃Z</span>
+      ↩ Undo <span class="key-hint">⌃Z</span>
       <div class="tooltip">
         <div class="tip-title">Undo</div>
-        <div class="tip-body">Step back through your last 60 changes. Works for node additions, deletions, renames, edge changes, and layout moves.</div>
+        <div class="tip-body">Step back through your last 60 changes — factor additions, removals, renames, connections, and moves.</div>
         <div class="tip-key">Ctrl + Z</div>
       </div>
     </button>
 
     <button class="tool-btn" onclick="app.redo()">
-      ↪ Redo
-      <span class="key-hint">⌃Y</span>
+      ↪ Redo <span class="key-hint">⌃Y</span>
       <div class="tooltip">
         <div class="tip-title">Redo</div>
-        <div class="tip-body">Re-apply a change that was undone. The redo stack is cleared whenever you make a new edit.</div>
+        <div class="tip-body">Re-apply a change that was undone. Making any new edit clears the redo history.</div>
         <div class="tip-key">Ctrl + Y</div>
       </div>
     </button>
 
     <button class="tool-btn" onclick="app.layout()">
-      ⊞ Layout
-      <span class="key-hint">L</span>
+      ⊞ Arrange <span class="key-hint">L</span>
       <div class="tooltip">
-        <div class="tip-title">Auto-Layout</div>
-        <div class="tip-body">Automatically arranges all nodes into a clean layered (top-to-bottom causal flow) layout using a Sugiyama-style algorithm. Saves an undo snapshot first.</div>
+        <div class="tip-title">Auto-Arrange</div>
+        <div class="tip-body">Automatically lays out all factors in a clean top-to-bottom flow, with causes at the top and outcomes at the bottom.</div>
         <div class="tip-key">L</div>
       </div>
     </button>
@@ -844,71 +687,87 @@
     <button class="tool-btn" onclick="app.clear()">
       ⟳ Clear
       <div class="tooltip">
-        <div class="tip-title">Clear Graph</div>
-        <div class="tip-body">Remove all nodes and edges and start fresh. You will be asked to confirm before anything is deleted.</div>
+        <div class="tip-title">Clear the Map</div>
+        <div class="tip-body">Remove all factors and connections and start fresh. You'll be asked to confirm first.</div>
       </div>
     </button>
 
     <div class="toolbar-sep"></div>
 
+    <!-- Dataset upload button in toolbar -->
+    <button class="action-btn upload-btn" onclick="triggerToolbarUpload()">
+      📊 Upload Data
+      <div class="tooltip">
+        <div class="tip-title">Upload Your Dataset</div>
+        <div class="tip-body">Upload a CSV or Excel file. The AI will read your column names and use them to help you build your map. The data itself never leaves your browser.</div>
+      </div>
+    </button>
+    <!-- Hidden file input for toolbar upload -->
+    <input type="file" id="toolbar-file-input" accept=".csv,.xlsx,.xls" style="display:none" onchange="handleToolbarUpload(event)" />
+
     <button class="action-btn secondary" onclick="loadGraph()">
       📂 Load
       <div class="tooltip">
-        <div class="tip-title">Load Graph</div>
-        <div class="tip-body">Open a previously saved DeepDive JSON file and import it onto the canvas. Replaces the current graph.</div>
+        <div class="tip-title">Load a Saved Map</div>
+        <div class="tip-body">Open a previously saved DeepDive map file and restore it to the canvas.</div>
       </div>
     </button>
 
-    <button class="action-btn secondary" onclick="saveGraph()" style="margin-left:5px">
+    <button class="action-btn secondary" onclick="saveGraph()">
       💾 Save
       <div class="tooltip">
-        <div class="tip-title">Save Graph</div>
-        <div class="tip-body">Download the current graph as a JSON file compatible with dag_sampler.py. All nodes must be named before saving.</div>
+        <div class="tip-title">Save Your Map</div>
+        <div class="tip-body">Download your current map as a file you can reload later or share. All factors must be named before saving.</div>
       </div>
     </button>
 
     <button class="action-btn primary" id="btn-submit" onclick="submitToServer()">
       ▶ Send to Server
       <div class="tooltip">
-        <div class="tip-title">Send to Local Server</div>
-        <div class="tip-body">POST the graph JSON to your local DeepDive bridge server (local_server.py must be running on port 7432). The server saves it to disk and can optionally trigger dag_sampler.py.</div>
+        <div class="tip-title">Send Map to Local Server</div>
+        <div class="tip-body">Send your map to a locally running DeepDive server (local_server.py on port 7432) to generate synthetic data or run analyses.</div>
       </div>
     </button>
   </div><!-- /toolbar -->
 
 
-  <!-- ══════════════════════════════════════════════════════════════════════
+  <!-- ═══════════════════════════════════════════════════════════════════════
        MAIN AREA
-  ═══════════════════════════════════════════════════════════════════════ -->
+  ════════════════════════════════════════════════════════════════════════ -->
   <div class="main-area">
 
-    <!-- ── Left sidebar ─────────────────────────────────────────────── -->
+    <!-- Left sidebar -->
     <aside class="left-sidebar">
 
       <div class="sidebar-section">
-        <div class="section-title">Graph Info</div>
-        <div class="stat-row"><span class="stat-label">Nodes</span>  <span class="stat-value" id="info-nodes">0</span></div>
-        <div class="stat-row"><span class="stat-label">Edges</span>  <span class="stat-value" id="info-edges">0</span></div>
-        <div class="stat-row"><span class="stat-label">Roots</span>  <span class="stat-value" id="info-roots">0</span></div>
-        <div class="stat-row"><span class="stat-label">Leaves</span> <span class="stat-value" id="info-leaves">0</span></div>
-        <div class="stat-row"><span class="stat-label">Acyclic</span><span class="stat-value ok" id="info-acyclic">✓ yes</span></div>
+        <div class="section-title">Map Summary</div>
+        <div class="stat-row"><span class="stat-label">Factors</span>    <span class="stat-value" id="info-nodes">0</span></div>
+        <div class="stat-row"><span class="stat-label">Connections</span><span class="stat-value" id="info-edges">0</span></div>
+        <div class="stat-row"><span class="stat-label">Starting factors</span><span class="stat-value" id="info-roots">0</span></div>
+        <div class="stat-row"><span class="stat-label">Outcomes</span>   <span class="stat-value" id="info-leaves">0</span></div>
+        <div class="stat-row"><span class="stat-label">No loops</span>   <span class="stat-value ok" id="info-acyclic">✓ yes</span></div>
+      </div>
+
+      <!-- Dataset strip — shown when file is uploaded -->
+      <div class="dataset-strip" id="dataset-strip">
+        <div class="dataset-strip-name" id="dataset-filename"></div>
+        <div class="dataset-strip-cols" id="dataset-colcount"></div>
       </div>
 
       <div class="node-panel" id="node-panel">
-        <div class="section-title">Selected Node</div>
-        <p class="empty-msg" id="node-empty-msg">Click a node to<br/>select and edit it.</p>
+        <div class="section-title">Selected Factor</div>
+        <p class="empty-msg" id="node-empty-msg">Click a factor to<br/>select and edit it.</p>
         <div id="node-form" style="display:none">
           <label class="field-label" for="node-name-input">Name *</label>
-          <input id="node-name-input" class="text-input" type="text" maxlength="24" placeholder="e.g. Rain, Income…" />
+          <input id="node-name-input" class="text-input" type="text" maxlength="24" placeholder="e.g. Rain, Income, Age…" />
 
-          <label class="field-label">Emoji (auto-assigned)</label>
-          <input id="node-emoji-display" class="text-input" type="text" disabled
-                 style="font-size:20px;text-align:center;opacity:0.7" placeholder="assigned by LLM…" />
+          <label class="field-label">Emoji (auto-assigned by AI)</label>
+          <input id="node-emoji-display" class="text-input" type="text" disabled style="font-size:20px;text-align:center;opacity:0.7" placeholder="…" />
 
-          <label class="field-label" for="node-vartype-select">Variable Type</label>
+          <label class="field-label" for="node-vartype-select">Data type</label>
           <select id="node-vartype-select" class="select-input"></select>
 
-          <label class="field-label" for="node-role">Role</label>
+          <label class="field-label" for="node-role">Role in map</label>
           <input id="node-role" class="text-input" type="text" disabled />
 
           <button class="apply-btn" onclick="applyNodeEdits()">Apply Changes ✓</button>
@@ -916,63 +775,96 @@
       </div>
 
       <div class="legend" id="var-type-legend">
-        <div class="section-title">Variable Types</div>
+        <div class="section-title">Data Types</div>
       </div>
     </aside>
 
-    <!-- ── Canvas ────────────────────────────────────────────────────── -->
-    <div class="canvas-area">
-      <canvas id="dag-canvas"></canvas>
-    </div>
+    <!-- Canvas + Results tab area -->
+    <div class="canvas-area" style="display:flex; flex-direction:column;">
 
-    <!-- ══════════════════════════════════════════════════════════════════
-         RIGHT PANEL — always-visible LLM chat, collapsible
-    ═══════════════════════════════════════════════════════════════════ -->
-    <div class="right-panel" id="right-panel">
-
-      <!-- Clickable vertical tab visible only when panel is collapsed -->
-      <div class="reopen-tab" onclick="toggleChatPanel()" title="Expand AI panel">
-        ▶ DeepDive AI
-      </div>
-
-      <!-- Collapsed strip label (decorative, behind the tab) -->
-      <span class="collapsed-label"></span>
-
-      <!-- Header -->
-      <div class="chat-header">
-        <span class="chat-header-title">⬡ DeepDive AI</span>
-        <span class="provider-badge" id="provider-badge">—</span>
-        <button class="chat-collapse-btn" id="collapse-btn"
-                onclick="toggleChatPanel()" title="Collapse / expand the AI panel">
-          ◀
+      <!-- Tab bar -->
+      <div class="tab-bar">
+        <button class="tab-btn active" id="tab-map"     onclick="switchTab('map')">⬡ Map</button>
+        <button class="tab-btn"        id="tab-results" onclick="switchTab('results')">
+          📊 Results
+          <span class="tab-badge" id="tab-badge"></span>
         </button>
       </div>
 
-      <!-- Message history -->
+      <!-- Canvas (Map tab) -->
+      <canvas id="dag-canvas" style="flex:1; display:block; width:100%;"></canvas>
+
+      <!-- Results panel (Results tab) -->
+      <div class="results-panel" id="results-panel">
+
+        <!-- Shown while analysis is running -->
+        <div class="results-empty" id="results-loading" style="display:none">
+          <div class="results-spinner"></div>
+          <div id="results-loading-msg">Analysis running…</div>
+        </div>
+
+        <!-- Shown when results are ready -->
+        <div class="results-toolbar" id="results-toolbar" style="display:none">
+          <span class="results-info" id="results-info"></span>
+          <a class="download-btn primary" id="download-predictions-btn"
+             href="#" download="predictions.csv">
+            ⬇ Download Predictions
+          </a>
+          <a class="download-btn" id="download-model-btn"
+             href="#" download="model.pt" style="display:none">
+            ⬇ Download Model (.pt)
+          </a>
+        </div>
+
+        <div class="results-table-wrap" id="results-table-wrap" style="display:none">
+          <table class="results-table" id="results-table">
+            <thead id="results-table-head"></thead>
+            <tbody id="results-table-body"></tbody>
+          </table>
+        </div>
+
+        <!-- Shown when no results yet and not running -->
+        <div class="results-empty" id="results-placeholder">
+          <div class="results-empty-icon">📊</div>
+          <div>Upload a dataset to see predictions here.</div>
+          <div style="font-size:11px; margin-top:4px;">
+            Use the <strong>📊 Upload Data</strong> button in the toolbar,<br/>
+            or describe your data to the AI assistant.
+          </div>
+        </div>
+
+      </div><!-- /results-panel -->
+
+    </div><!-- /canvas-area -->
+
+    <!-- Right panel — AI chat -->
+    <div class="right-panel" id="right-panel">
+
+      <div class="reopen-tab" onclick="toggleChatPanel()" title="Expand AI panel">
+        ▶ DeepDive AI
+      </div>
+      <span class="collapsed-label"></span>
+
+      <div class="chat-header">
+        <span class="chat-header-title">⬡ DeepDive AI</span>
+        <span class="provider-badge" id="provider-badge">—</span>
+        <button class="chat-collapse-btn" id="collapse-btn" onclick="toggleChatPanel()" title="Collapse AI panel">◀</button>
+      </div>
+
       <div class="chat-messages" id="chat-messages"></div>
 
-      <!-- Input -->
       <div class="chat-input-area">
         <div class="chat-input-row">
-          <textarea
-            id="chat-textarea"
-            class="chat-textarea"
-            placeholder="Ask me anything about your causal model…"
-            rows="1"
-          ></textarea>
-          <button class="chat-send-btn" id="chat-send-btn" onclick="sendChatMessage()">
-            ↑
-          </button>
+          <textarea id="chat-textarea" class="chat-textarea" placeholder="Ask anything about your map…" rows="1"></textarea>
+          <button class="chat-send-btn" id="chat-send-btn" onclick="sendChatMessage()">↑</button>
         </div>
       </div>
-    </div><!-- /right-panel -->
+    </div>
 
   </div><!-- /main-area -->
 
 
-  <!-- ══════════════════════════════════════════════════════════════════════
-       STATUS BAR
-  ═══════════════════════════════════════════════════════════════════════ -->
+  <!-- Status bar -->
   <div class="status-bar">
     <span class="status-msg" id="status-msg">Ready.</span>
     <span class="status-server">
@@ -984,26 +876,14 @@
 </div><!-- /app-shell -->
 
 
-<!-- ═══════════════════════════════════════════════════════════════════════════
-     RENAME DIALOG — name only; emoji is auto-assigned by LLM
-════════════════════════════════════════════════════════════════════════════ -->
+<!-- Rename dialog -->
 <dialog id="rename-dialog">
-  <div class="dialog-header">Name this node</div>
+  <div class="dialog-header">Name this factor</div>
   <div class="dialog-body">
-    <label class="field-label" for="rename-input">Node Name *</label>
-    <input
-      id="rename-input"
-      class="text-input"
-      type="text"
-      maxlength="24"
-      placeholder="e.g. Rain, Income, Smoking…"
-      autocomplete="off"
-    />
+    <label class="field-label" for="rename-input">Factor Name *</label>
+    <input id="rename-input" class="text-input" type="text" maxlength="24" placeholder="e.g. Rain, Income, Exercise…" autocomplete="off" />
     <p class="name-error" id="rename-error"></p>
-    <p class="dialog-hint">
-      Keep names short (under 14 chars). An emoji will be automatically
-      chosen by the AI as soon as you confirm.
-    </p>
+    <p class="dialog-hint">Keep it short (under 14 characters). An emoji will be chosen automatically by the AI.</p>
   </div>
   <div class="dialog-footer">
     <button class="dialog-btn" onclick="closeRenameDialog(false)">Cancel</button>
@@ -1011,29 +891,36 @@
   </div>
 </dialog>
 
+<!-- Hidden file input for drag-and-drop upload zone -->
+<input type="file" id="chat-file-input" accept=".csv,.xlsx,.xls" style="display:none" onchange="handleChatUpload(event)" />
+
 <div class="toast-container" id="toast-container"></div>
 
 
-<!-- ═══════════════════════════════════════════════════════════════════════════
-     SCRIPTS — load order: gemini_bridge first, then dag_editor, then bootstrap
-════════════════════════════════════════════════════════════════════════════ -->
+<!-- Scripts — load order matters -->
 <script src="gemini_bridge.js"></script>
 <script src="dag_editor.js"></script>
 <script>
 /**
  * DeepDive — App bootstrap
  * ════════════════════════════════════════════════════════════════════════════
- * Wires together DAGEditor, DeepDiveLLM, sidebar, chat panel, tooltips,
- * server communication, onboarding conversation, and all UI state.
+ * Wires DAGEditor + DeepDiveLLM + UI together.
+ * Jargon-free throughout — users see "factor", "connection", "outcome",
+ * never "node", "edge", "DAG", "acyclic", "root".
  */
 
 // ── Globals ──────────────────────────────────────────────────────────────────
-let app;                      // DAGEditor instance
-let _currentGraph  = null;    // latest exported graph (null if unnamed nodes)
-let _chatHistory   = [];      // session-only LLM conversation history
-let _chatPhase     = "onboarding"; // "onboarding" | "chat"
-let _onboardingActive = false; // true while waiting for user's Yes/No choice
+let app;
+let _currentGraph       = null;
+let _chatHistory        = [];
+let _chatPhase          = "onboarding";  // "onboarding" | "chat"
+let _onboardingActive   = true;
 let _chatPanelCollapsed = false;
+let _responseVar        = null;    // chosen outcome column name
+let _currentTab         = "map";   // "map" | "results"
+let _uploadedFile       = null;    // raw File object kept for server upload
+let _analysisTimestamp  = null;    // timestamp key for current analysis job
+let _predictionsData    = null;    // parsed predictions array for table render
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1042,57 +929,61 @@ let _chatPanelCollapsed = false;
 
 document.addEventListener("DOMContentLoaded", () => {
 
-  // Instantiate the canvas editor
   app = new DAGEditor("dag-canvas", {
     onGraphChange: handleGraphChange,
     onStatus:      setStatus,
     onNodeSelect:  handleNodeSelect,
   });
 
-  // Populate sidebar var-type dropdown + legend
   buildVarTypeUI();
-
-  // Show provider label in chat header
   document.getElementById("provider-badge").textContent = DeepDiveLLM.providerLabel;
 
-  // Fetch the LLM API key from local_server.py
   DeepDiveLLM.fetchApiKey((msg, type) => {
     appendChatBubble("assistant", `🔌 ${msg}`);
-    updateServerDot(type, type === "ok" ? "server online" : "server offline");
-  }).then(() => {
-    // Start onboarding after key fetch attempt (succeeds or not)
-    startOnboarding();
-  });
+    updateServerDot(type, type === "ok" ? "AI ready" : "AI offline");
+  }).then(() => startOnboarding());
 
-  // Also ping the bridge server for the status dot
   pingLocalServer();
 
-  // Rename dialog: submit on Enter
   document.getElementById("rename-input").addEventListener("keydown", e => {
     if (e.key === "Enter") closeRenameDialog(true);
   });
 
-  // Chat textarea: send on Enter (Shift+Enter = newline)
   document.getElementById("chat-textarea").addEventListener("keydown", e => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendChatMessage();
-    }
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChatMessage(); }
+  });
+
+  // Wire drag-and-drop on the canvas area (not just the upload zone)
+  const canvasArea = document.querySelector(".canvas-area");
+  canvasArea.addEventListener("dragover",  e => { e.preventDefault(); });
+  canvasArea.addEventListener("drop",      e => {
+    e.preventDefault();
+    const file = e.dataTransfer?.files?.[0];
+    if (file) processUploadedFile(file);
   });
 });
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Sidebar builders
+// Sidebar UI
 // ─────────────────────────────────────────────────────────────────────────────
 
 function buildVarTypeUI() {
+  // Map internal var_type keys to plain English for the dropdown
+  const plainLabels = {
+    continuous:  "Number (e.g. weight, temperature)",
+    binary:      "Yes / No (e.g. smoker, employed)",
+    ordinal:     "Ordered levels (e.g. low / medium / high)",
+    categorical: "Categories (e.g. country, blood type)",
+    count:       "Count (e.g. number of visits)",
+  };
+
   const sel = document.getElementById("node-vartype-select");
   sel.innerHTML = "";
   for (const [key, vt] of Object.entries(VAR_TYPES)) {
     const opt = document.createElement("option");
     opt.value       = key;
-    opt.textContent = `${vt.label}  ${key} — ${vt.desc}`;
+    opt.textContent = plainLabels[key] || vt.desc;
     sel.appendChild(opt);
   }
 
@@ -1105,7 +996,7 @@ function buildVarTypeUI() {
     row.className = "legend-row";
     row.innerHTML = `
       <span class="legend-dot" style="background:${vt.color}"></span>
-      <span style="color:var(--text-dim)">${key}</span>
+      <span style="color:var(--text-dim)">${plainLabels[key] || key}</span>
       <span style="color:${vt.color};margin-left:auto;font-size:12px">${vt.label}</span>
     `;
     legend.appendChild(row);
@@ -1119,11 +1010,9 @@ function buildVarTypeUI() {
 
 function handleGraphChange(graph) {
   _currentGraph = graph;
-
-  const nodes  = app.nodes;
-  const edges  = app.edges;
-  const hasP   = new Set(edges.map(([,t]) => t));
-  const hasC   = new Set(edges.map(([s]) => s));
+  const nodes = app.nodes, edges = app.edges;
+  const hasP  = new Set(edges.map(([,t]) => t));
+  const hasC  = new Set(edges.map(([s]) => s));
 
   document.getElementById("info-nodes").textContent  = nodes.length;
   document.getElementById("info-edges").textContent  = edges.length;
@@ -1132,40 +1021,31 @@ function handleGraphChange(graph) {
 
   const acEl = document.getElementById("info-acyclic");
   if (graph === null && nodes.some(n => !n.name.trim())) {
-    acEl.textContent = "⚠ unnamed nodes";
-    acEl.className   = "stat-value warn";
+    acEl.textContent = "⚠ unnamed factors"; acEl.className = "stat-value warn";
   } else {
-    acEl.textContent = "✓ yes";
-    acEl.className   = "stat-value ok";
+    acEl.textContent = "✓ yes"; acEl.className = "stat-value ok";
   }
 }
 
 function handleNodeSelect(node) {
   const form  = document.getElementById("node-form");
   const empty = document.getElementById("node-empty-msg");
+  if (!node) { form.style.display = "none"; empty.style.display = "block"; return; }
 
-  if (!node) {
-    form.style.display  = "none";
-    empty.style.display = "block";
-    return;
-  }
-  form.style.display  = "block";
-  empty.style.display = "none";
-
-  document.getElementById("node-name-input").value    = node.name;
-  document.getElementById("node-emoji-display").value = node.emoji || "…";
+  form.style.display = "block"; empty.style.display = "none";
+  document.getElementById("node-name-input").value     = node.name;
+  document.getElementById("node-emoji-display").value  = node.emoji || "…";
   document.getElementById("node-vartype-select").value = node.varType;
 
-  const edges  = app.edges;
-  const hasP   = new Set(edges.map(([,t]) => t));
-  const hasC   = new Set(edges.map(([s]) => s));
-  const isRoot = !hasP.has(node.id);
-  const isLeaf = !hasC.has(node.id);
+  const edges = app.edges;
+  const hasP  = new Set(edges.map(([,t]) => t));
+  const hasC  = new Set(edges.map(([s]) => s));
+  const isRoot = !hasP.has(node.id), isLeaf = !hasC.has(node.id);
   document.getElementById("node-role").value =
-    isRoot && isLeaf ? "isolated"
-    : isRoot         ? "root (exogenous)"
-    : isLeaf         ? "leaf (observable)"
-    :                  "intermediate";
+    isRoot && isLeaf ? "standalone"
+    : isRoot         ? "starting factor (cause)"
+    : isLeaf         ? "outcome"
+    :                  "intermediate factor";
 }
 
 function applyNodeEdits() {
@@ -1174,38 +1054,30 @@ function applyNodeEdits() {
   const name    = document.getElementById("node-name-input").value.trim();
   const varType = document.getElementById("node-vartype-select").value;
   app.updateNode(node.id, { name, varType });
-  setStatus(name ? `Updated node "${name}".` : "⚠ Node still has no name.");
+  setStatus(name ? `Updated: "${name}"` : "⚠ Factor still has no name.");
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Mode button active state
+// Mode buttons
 // ─────────────────────────────────────────────────────────────────────────────
 
 function appSetMode(mode) {
   app.setMode(mode);
-  const map = {
-    select: "btn-select", add_node: "btn-add-node",
-    add_edge: "btn-add-edge", delete: "btn-delete",
-  };
-  for (const [m, id] of Object.entries(map)) {
+  const map = { select:"btn-select", add_node:"btn-add-node", add_edge:"btn-add-edge", delete:"btn-delete" };
+  for (const [m, id] of Object.entries(map))
     document.getElementById(id)?.classList.toggle("active", m === mode);
-  }
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Chat panel — collapse / expand
+// Chat panel collapse
 // ─────────────────────────────────────────────────────────────────────────────
 
 function toggleChatPanel() {
   _chatPanelCollapsed = !_chatPanelCollapsed;
-  const panel = document.getElementById("right-panel");
-  const btn   = document.getElementById("collapse-btn");
-  panel.classList.toggle("collapsed", _chatPanelCollapsed);
-  // Arrow points left (◀) when open = "click to collapse"
-  // Arrow points right (▶) when collapsed = "click to expand" (reopen-tab handles this)
-  btn.textContent = _chatPanelCollapsed ? "▶" : "◀";
+  document.getElementById("right-panel").classList.toggle("collapsed", _chatPanelCollapsed);
+  document.getElementById("collapse-btn").textContent = _chatPanelCollapsed ? "▶" : "◀";
 }
 
 
@@ -1214,183 +1086,306 @@ function toggleChatPanel() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Append a chat bubble to the message thread.
+ * Append a chat bubble.
  * @param {"assistant"|"user"} role
- * @param {string} text   — plain text (newlines become <br>)
- * @param {boolean} isHTML — if true, set innerHTML directly (trusted LLM strings only)
+ * @param {string}  text
+ * @param {boolean} isHTML  — true only for trusted internal HTML (onboarding UI)
  */
 function appendChatBubble(role, text, isHTML = false) {
   const container = document.getElementById("chat-messages");
   const bubble    = document.createElement("div");
   bubble.className = `chat-bubble ${role}`;
-
   if (isHTML) {
     bubble.innerHTML = text;
   } else {
-    // Safely render newlines as line breaks without innerHTML injection risk
     bubble.textContent = text;
     bubble.innerHTML   = bubble.innerHTML.replace(/\n/g, "<br>");
   }
-
   container.appendChild(bubble);
   container.scrollTop = container.scrollHeight;
   return bubble;
 }
 
-/** Show the animated typing indicator. Returns a reference to remove it later. */
 function showTyping() {
   const container = document.getElementById("chat-messages");
   const el = document.createElement("div");
-  el.className = "typing-indicator";
-  el.id = "typing-indicator";
-  el.innerHTML = `
-    <span class="typing-dot"></span>
-    <span class="typing-dot"></span>
-    <span class="typing-dot"></span>
-  `;
+  el.className = "typing-indicator"; el.id = "typing-indicator";
+  el.innerHTML = `<span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>`;
   container.appendChild(el);
   container.scrollTop = container.scrollHeight;
-  return el;
 }
+function hideTyping() { document.getElementById("typing-indicator")?.remove(); }
 
-/** Remove the typing indicator. */
-function hideTyping() {
-  document.getElementById("typing-indicator")?.remove();
-}
-
-/** Disable / enable the chat send button. */
 function setChatBusy(busy) {
   const btn = document.getElementById("chat-send-btn");
-  btn.disabled = busy;
-  btn.textContent = busy ? "…" : "↑";
+  btn.disabled = busy; btn.textContent = busy ? "…" : "↑";
 }
 
-/**
- * Import a graph returned by the LLM onto the canvas and notify the user.
- */
 function importLLMGraph(graph) {
   if (!graph) return;
   app.importGraph(graph, true);
   const notice = document.createElement("div");
-  notice.className  = "dag-imported-notice";
-  notice.textContent = `✓ DAG imported — ${graph.nodes?.length} nodes`;
+  notice.className  = "map-imported-notice";
+  notice.textContent = `✓ Map updated — ${graph.nodes?.length} factors, ${graph.edges?.length} connections`;
   document.getElementById("chat-messages").appendChild(notice);
   document.getElementById("chat-messages").scrollTop = 9999;
-  toast("DAG imported onto canvas ✓", "ok");
-  setStatus(`DAG imported: ${graph.nodes?.length} nodes, ${graph.edges?.length} edges.`);
+  toast("Map imported ✓", "ok");
+  setStatus(`Map updated: ${graph.nodes?.length} factors, ${graph.edges?.length} connections.`);
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Onboarding conversation
+// Dataset upload
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Toolbar upload button → open file picker */
+function triggerToolbarUpload() {
+  document.getElementById("toolbar-file-input").click();
+}
+
+/** Toolbar file picker onChange */
+async function handleToolbarUpload(e) {
+  const file = e.target.files?.[0];
+  e.target.value = "";   // reset so same file can be re-uploaded
+  if (file) await processUploadedFile(file);
+}
+
+/** Chat upload zone file picker onChange */
+async function handleChatUpload(e) {
+  const file = e.target.files?.[0];
+  e.target.value = "";
+  if (file) await processUploadedFile(file);
+}
+
 /**
- * Start the onboarding flow.
- * Called once on page load, after the API key fetch attempt.
- * Fires every time the page loads (no localStorage persistence by design).
+ * Core upload handler — parses the file, updates the sidebar strip,
+ * posts a confirmation in the chat, and (if in onboarding) advances
+ * the conversation with the headers as context.
  */
+async function processUploadedFile(file) {
+  // Hide the upload zone in chat if visible
+  if (zone) zone.classList.remove("visible");
+
+  // Parse headers
+  const headers = await DeepDiveLLM.parseAndStoreDataset(file, (msg, type) => {
+    setStatus(msg);
+  });
+
+  if (!headers.length) {
+    toast("Could not read file. Check it's a valid CSV or XLSX.", "error");
+    return;
+  }
+
+  // Update sidebar dataset strip
+  const strip = document.getElementById("dataset-strip");
+  document.getElementById("dataset-filename").textContent = `📊 ${file.name}`;
+  document.getElementById("dataset-colcount").textContent =
+    `${headers.length} columns: ${headers.slice(0, 5).join(", ")}${headers.length > 5 ? "…" : ""}`;
+  strip.classList.add("visible");
+
+  // Confirm upload in chat
+  appendChatBubble("assistant",
+    `📊 Got it! I can see your file has ${headers.length} columns:\n${headers.join(", ")}\n\nWhich of these is the main outcome you want to understand or predict?`,
+  );
+
+  // Switch to chat mode — the dataset context will be injected into prompts automatically
+  _chatPhase     = "chat";
+  _onboardingActive = false;
+
+  // Remove onboarding choice buttons if they're still showing
+  document.querySelectorAll(".onboarding-choices").forEach(el => el.remove());
+
+  toast(`Loaded: ${file.name} (${headers.length} columns)`, "ok");
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Onboarding
+// ─────────────────────────────────────────────────────────────────────────────
+
 function startOnboarding() {
-  _chatPhase       = "onboarding";
-  _chatHistory     = [];
+  _chatPhase        = "onboarding";
+  _chatHistory      = [];
   _onboardingActive = true;
 
-  // Greeting message with Yes / No buttons
   const greetingHTML = `
     <strong>Welcome to DeepDive!</strong><br><br>
-    I'm your causal modelling assistant. I can help you build a causal graph
-    by asking you a few questions about what you want to model.<br><br>
-    Would you like a guided walkthrough?
+    I'm your AI assistant. I'll help you build a visual map showing how
+    different factors in your situation connect and influence each other.<br><br>
+    How would you like to get started?
     <div class="onboarding-choices">
-      <button class="choice-btn yes" onclick="onboardingChoice(true)">Yes, guide me ✓</button>
-      <button class="choice-btn no"  onclick="onboardingChoice(false)">No, I'll build manually</button>
+      <button class="choice-btn yes"    onclick="onboardingChoice('guide')">
+        ✓ Guide me through it
+      </button>
+      <button class="choice-btn upload" onclick="onboardingChoice('upload')">
+        📊 Upload my dataset
+      </button>
+      <button class="choice-btn no"     onclick="onboardingChoice('manual')">
+        I'll build it myself
+      </button>
+    </div>
+    <!-- Upload zone — shown when user picks "upload" -->
+    <div class="upload-zone" id="chat-upload-zone"
+         onclick="document.getElementById('chat-file-input').click()"
+         ondragover="event.preventDefault(); this.classList.add('drag-over')"
+         ondragleave="this.classList.remove('drag-over')"
+         ondrop="event.preventDefault(); this.classList.remove('drag-over'); handleChatDrop(event)">
+      <div class="upload-zone-icon">📂</div>
+      <div>Click or drag a file here</div>
+      <div class="upload-zone-hint">Supports CSV and Excel (.xlsx) files</div>
     </div>
   `;
   appendChatBubble("assistant", greetingHTML, true);
 }
 
-/**
- * Handle the user's Yes / No response to the onboarding prompt.
- * @param {boolean} wantsHelp
- */
-async function onboardingChoice(wantsHelp) {
-  // Remove the choice buttons by replacing the last bubble's footer
-  document.querySelectorAll(".onboarding-choices").forEach(el => {
-    el.innerHTML = wantsHelp
-      ? `<em style="color:var(--green);font-size:11px">✓ Starting guided walkthrough…</em>`
-      : `<em style="color:var(--text-dim);font-size:11px">Skipped — building manually.</em>`;
-  });
+/** Handle drop on the chat upload zone */
+function handleChatDrop(e) {
+  const file = e.dataTransfer?.files?.[0];
+  if (file) processUploadedFile(file);
+}
 
+async function onboardingChoice(choice) {
   _onboardingActive = false;
 
-  if (!wantsHelp) {
-    // Skip onboarding — switch directly to general chat mode
-    _chatPhase   = "chat";
-    _chatHistory = [];
+  // Replace choice buttons with a confirmation label
+  document.querySelectorAll(".onboarding-choices").forEach(el => {
+    const labels = { guide: "✓ Starting guided setup…", upload: "📊 Opening upload…", manual: "Building manually." };
+    el.innerHTML = `<em style="color:var(--text-dim);font-size:11px">${labels[choice]}</em>`;
+  });
+
+  if (choice === "manual") {
+    _chatPhase = "chat";
     appendChatBubble("assistant",
-      "No problem! Build your graph manually using the toolbar, or just ask me anything about causal modelling."
+      "No problem! Use the toolbar to add factors (＋ Factor) and draw connections (→ Connect). " +
+      "Ask me anything if you get stuck."
     );
     return;
   }
 
-  // User wants help — send first onboarding message
-  appendChatBubble("user", "Yes, guide me.");
+  if (choice === "upload") {
+    // Show the upload zone inside the onboarding bubble
+    const zone = document.getElementById("chat-upload-zone");
+    if (zone) zone.classList.add("visible");
+    return;
+  }
+
+  // choice === "guide"
+  appendChatBubble("user", "Guide me through it.");
   setChatBusy(true);
-  const typing = showTyping();
+  showTyping();
 
   const { reply, graph } = await DeepDiveLLM.onboardingTurn(
     _chatHistory,
-    "Yes, I'd like help building a causal DAG."
+    "I'd like help building a cause-and-effect map."
   );
 
   hideTyping();
   setChatBusy(false);
 
   if (reply) appendChatBubble("assistant", reply);
-  if (graph) {
-    importLLMGraph(graph);
-    _chatPhase = "chat";   // DAG built — switch to general chat for follow-up questions
-  }
+  if (graph) { importLLMGraph(graph); _chatPhase = "chat"; }
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// General chat send
+// General chat
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Send the user's message from the chat textarea.
- * Routes to onboardingTurn or chatTurn depending on the current phase.
- */
 async function sendChatMessage() {
   const textarea = document.getElementById("chat-textarea");
   const text     = textarea.value.trim();
-  if (!text) return;
-
-  // Don't allow sending while the Yes/No onboarding prompt is still showing
-  if (_onboardingActive) return;
+  if (!text || _onboardingActive) return;
 
   textarea.value = "";
   appendChatBubble("user", text);
   setChatBusy(true);
-  const typing = showTyping();
+  showTyping();
 
   let reply, graph;
 
   if (_chatPhase === "onboarding") {
-    // Still in guided onboarding — use the onboarding system prompt
     ({ reply, graph } = await DeepDiveLLM.onboardingTurn(_chatHistory, text));
-    if (graph) _chatPhase = "chat";  // DAG produced — onboarding complete
+    if (graph) _chatPhase = "chat";
   } else {
-    // General chat mode
     ({ reply, graph } = await DeepDiveLLM.chatTurn(_chatHistory, text));
   }
 
   hideTyping();
   setChatBusy(false);
 
-  if (reply) appendChatBubble("assistant", reply);
+  if (reply) {
+    appendChatBubble("assistant", reply);
+
+    // ── Detect when the user has identified an outcome variable ───────────
+    // If dataset headers exist and the reply seems to confirm an outcome,
+    // offer the literature search button.
+    const headers = DeepDiveLLM.getDatasetHeaders();
+    if (headers.length && !_responseVar) {
+      const identified = _detectResponseVar(text, headers);
+      if (identified) {
+        _responseVar = identified;
+        _offerLiteratureSearch(identified);
+      }
+    }
+  }
+
   if (graph) importLLMGraph(graph);
+}
+
+/**
+ * Try to detect if the user just named an outcome variable from the dataset.
+ * Simple heuristic: check if any header appears in the user's message.
+ */
+function _detectResponseVar(userText, headers) {
+  const lower = userText.toLowerCase();
+  return headers.find(h => lower.includes(h.toLowerCase())) || null;
+}
+
+/**
+ * Append a literature search offer bubble after an outcome is identified.
+ */
+function _offerLiteratureSearch(responseVar) {
+  const html = `
+    I noticed you mentioned <strong>${responseVar}</strong> as your outcome.
+    Would you like me to search the research literature to see which of your
+    other variables have evidence linking them to ${responseVar}, and whether
+    there are important factors you might be missing?
+    <br>
+    <button class="lit-search-btn" id="lit-search-btn"
+            onclick="runLiteratureSearch('${responseVar.replace(/'/g, "\\'")}')">
+      🔍 Search research literature
+    </button>
+  `;
+  appendChatBubble("assistant", html, true);
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Literature search
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runLiteratureSearch(responseVar) {
+  const btn = document.getElementById("lit-search-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "🔍 Searching…"; }
+
+  appendChatBubble("user", `Search the literature for what influences ${responseVar}.`);
+  setChatBusy(true);
+  showTyping();
+
+  const result = await DeepDiveLLM.searchLiterature(responseVar, (msg, type) => {
+    setStatus(msg);
+  });
+
+  hideTyping();
+  setChatBusy(false);
+
+  if (result) {
+    appendChatBubble("assistant", result);
+    // Also add it to chat history so the LLM can reference it later
+    _chatHistory.push({ role: "assistant", content: result });
+  } else {
+    appendChatBubble("assistant", "The literature search didn't return results. Try again in a moment.");
+  }
 }
 
 
@@ -1400,31 +1395,27 @@ async function sendChatMessage() {
 
 function saveGraph() {
   const graph = app.exportGraph();
-  if (!graph) { toast("Name all nodes before saving.", "warn"); return; }
+  if (!graph) { toast("Name all factors before saving.", "warn"); return; }
   const blob = new Blob([JSON.stringify(graph, null, 2)], { type: "application/json" });
-  const url  = URL.createObjectURL(blob);
-  const a    = Object.assign(document.createElement("a"), {
-    href: url,
-    download: `dag_${new Date().toISOString().slice(0,19).replace(/[T:]/g, "-")}.json`,
+  const a = Object.assign(document.createElement("a"), {
+    href: URL.createObjectURL(blob),
+    download: `deepdive_map_${new Date().toISOString().slice(0,10)}.json`,
   });
   a.click();
-  URL.revokeObjectURL(url);
-  setStatus("Graph saved.");
+  URL.revokeObjectURL(a.href);
+  setStatus("Map saved.");
 }
 
 function loadGraph() {
-  const input = Object.assign(document.createElement("input"), {
-    type: "file", accept: ".json,application/json",
-  });
+  const input = Object.assign(document.createElement("input"), { type: "file", accept: ".json" });
   input.onchange = async e => {
     const file = e.target.files[0];
     if (!file) return;
     try {
-      const graph = JSON.parse(await file.text());
-      app.importGraph(graph, false);
+      app.importGraph(JSON.parse(await file.text()), false);
       toast(`Loaded "${file.name}" ✓`, "ok");
     } catch (err) {
-      toast(`Failed to load: ${err.message}`, "error");
+      toast(`Could not load file: ${err.message}`, "error");
     }
   };
   input.click();
@@ -1437,61 +1428,49 @@ function loadGraph() {
 
 async function submitToServer() {
   const graph = app.exportGraph();
-  if (!graph)               { toast("Name all nodes before submitting.", "warn"); return; }
-  if (!graph.nodes.length)  { toast("Build a graph before submitting.", "warn"); return; }
+  if (!graph)              { toast("Name all factors before submitting.", "warn"); return; }
+  if (!graph.nodes.length) { toast("Build a map before submitting.", "warn"); return; }
 
   const btn = document.getElementById("btn-submit");
-  btn.disabled    = true;
-  btn.textContent = "Sending…";
-  setStatus("Sending DAG to local server…");
+  btn.disabled = true; btn.textContent = "Sending…";
+  setStatus("Sending map to local server…");
 
   try {
     const res  = await fetch(`${DeepDiveLLM.LOCAL_SERVER_URL}/dag`, {
-      method:  "POST",
+      method: "POST",
       headers: { "Content-Type": "application/json" },
-      body:    JSON.stringify(graph),
-      signal:  AbortSignal.timeout(8000),
+      body: JSON.stringify(graph),
+      signal: AbortSignal.timeout(8000),
     });
     const data = await res.json();
-
     if (res.ok) {
-      toast(`Sent ✓  ${data.nodes} nodes → ${data.saved_to}`, "ok");
+      toast(`Sent ✓  ${data.nodes} factors → ${data.saved_to}`, "ok");
       setStatus(`Saved to: ${data.saved_to}`);
       updateServerDot("ok", "server online");
     } else {
-      const detail = (data.details || [data.error]).join("; ");
-      toast(`Server rejected DAG: ${detail}`, "error");
-      setStatus(`Server error: ${detail}`);
+      toast(`Server error: ${(data.details || [data.error]).join("; ")}`, "error");
     }
   } catch {
     toast("Could not reach local server. Is local_server.py running?", "error");
-    setStatus("Local server unreachable.");
     updateServerDot("error", "server offline");
   }
 
-  btn.disabled    = false;
-  btn.textContent = "▶ Send to Server";
+  btn.disabled = false; btn.textContent = "▶ Send to Server";
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Server health ping
+// Server ping
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function pingLocalServer() {
   try {
-    const res  = await fetch(`${DeepDiveLLM.LOCAL_SERVER_URL}/status`, {
-      signal: AbortSignal.timeout(2500),
-    });
+    const res = await fetch(`${DeepDiveLLM.LOCAL_SERVER_URL}/status`, { signal: AbortSignal.timeout(2500) });
     if (res.ok) {
-      const data = await res.json();
-      updateServerDot("ok", `server online (${data.total_received} DAGs received)`);
-    } else {
-      updateServerDot("warn", "server error");
-    }
-  } catch {
-    updateServerDot("error", "server offline");
-  }
+      const d = await res.json();
+      updateServerDot("ok", `local server online (${d.total_received} maps received)`);
+    } else updateServerDot("warn", "server error");
+  } catch { updateServerDot("error", "local server offline"); }
 }
 
 function updateServerDot(type, label) {
@@ -1508,25 +1487,342 @@ function closeRenameDialog(confirmed) {
   const dlg   = document.getElementById("rename-dialog");
   const input = document.getElementById("rename-input");
   const err   = document.getElementById("rename-error");
-
   if (confirmed) {
-    if (!input.value.trim()) {
-      err.textContent = "Node name cannot be empty.";
-      input.focus();
-      return;
-    }
-    err.textContent = "";
-    dlg.returnValue = "ok";
-  } else {
-    dlg.returnValue = "cancel";
-  }
+    if (!input.value.trim()) { err.textContent = "Please enter a name."; input.focus(); return; }
+    err.textContent = ""; dlg.returnValue = "ok";
+  } else { dlg.returnValue = "cancel"; }
   dlg.close(dlg.returnValue);
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Status bar + toasts
+// Tab switching — Map / Results
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Switch between the Map canvas and the Results table.
+ * @param {"map"|"results"} tab
+ */
+function switchTab(tab) {
+  _currentTab = tab;
+
+  const canvas       = document.getElementById("dag-canvas");
+  const resultsPanel = document.getElementById("results-panel");
+  const tabMap       = document.getElementById("tab-map");
+  const tabResults   = document.getElementById("tab-results");
+
+  if (tab === "map") {
+    canvas.style.display       = "block";
+    resultsPanel.classList.remove("visible");
+    tabMap.classList.add("active");
+    tabResults.classList.remove("active");
+  } else {
+    canvas.style.display       = "none";
+    resultsPanel.classList.add("visible");
+    tabMap.classList.remove("active");
+    tabResults.classList.add("active");
+  }
+}
+
+/** Update the badge on the Results tab. */
+function setTabBadge(status) {
+  const badge = document.getElementById("tab-badge");
+  badge.className = `tab-badge ${status}`;
+  const labels = {
+    "":        "",
+    running:   "Running…",
+    complete:  "Ready",
+    error:     "Error",
+  };
+  badge.textContent = labels[status] ?? status;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Upload file to local server + start analysis
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Send the uploaded file to local_server.py /upload endpoint.
+ * Called after the user has identified the response variable.
+ *
+ * @param {string} responseVar  — the column name of the response variable
+ */
+async function sendFileToServer(responseVar) {
+  if (!_uploadedFile) {
+    appendChatBubble("assistant",
+      "I don't have your dataset file yet. Please upload it using the " +
+      "📊 Upload Data button in the toolbar."
+    );
+    return;
+  }
+
+  // Get current graph for the server (may be null if no map built yet)
+  const graph = app.exportGraph ? app.exportGraph() : null;
+
+  appendChatBubble("assistant",
+    `📤 Sending "${_uploadedFile.name}" to your local server for analysis…`
+  );
+  setTabBadge("running");
+
+  const { ok, timestamp } = await DeepDiveLLM.uploadDataset(
+    _uploadedFile,
+    responseVar,
+    graph,
+    (msg, type) => setStatus(msg)
+  );
+
+  if (!ok) {
+    setTabBadge("error");
+    appendChatBubble("assistant",
+      "⚠ Could not send the file to the local server. " +
+      "Make sure local_server.py is running, then try again."
+    );
+    return;
+  }
+
+  _analysisTimestamp = timestamp;
+
+  appendChatBubble("assistant",
+    `✓ File received by your local server. Analysis started for "${responseVar}".\n` +
+    `I'll let you know when predictions are ready. You can switch to the Results tab to watch progress.`
+  );
+
+  // Switch to Results tab and show spinner
+  switchTab("results");
+  showResultsLoading(`Analysing "${responseVar}"…`);
+
+  // Start polling
+  startPolling();
+}
+
+/** Show the loading spinner inside the Results panel. */
+function showResultsLoading(msg) {
+  document.getElementById("results-placeholder").style.display = "none";
+  document.getElementById("results-toolbar").style.display     = "none";
+  document.getElementById("results-table-wrap").style.display  = "none";
+  document.getElementById("results-loading").style.display     = "flex";
+  document.getElementById("results-loading-msg").textContent   = msg || "Analysis running…";
+}
+
+/** Hide the loading spinner. */
+function hideResultsLoading() {
+  document.getElementById("results-loading").style.display = "none";
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Poll /upload_status and render results when complete
+// ─────────────────────────────────────────────────────────────────────────────
+
+function startPolling() {
+  if (_analysisPolling) return;
+  _analysisPolling = true;
+
+  DeepDiveLLM.pollAnalysisStatus((status) => {
+    // Update loading message each poll cycle
+    if (status.status === "running") {
+      const msg = status.n_predicted > 0
+        ? `Analysing… ${status.n_predicted} rows processed so far.`
+        : "Analysis running…";
+      document.getElementById("results-loading-msg").textContent = msg;
+    }
+
+    if (status.status === "complete") {
+      _analysisPolling = false;
+      setTabBadge("complete");
+      hideResultsLoading();
+      onAnalysisComplete(status);
+    }
+
+    if (status.status === "error") {
+      _analysisPolling = false;
+      setTabBadge("error");
+      hideResultsLoading();
+      onAnalysisError(status);
+    }
+  });
+}
+
+/**
+ * Handle successful analysis completion.
+ * Fetches predictions.csv, renders the table, sets up download links.
+ */
+async function onAnalysisComplete(status) {
+  const ts = _analysisTimestamp;
+
+  // Notify in chat
+  appendChatBubble("assistant",
+    `✓ Analysis complete! ${status.n_predicted} prediction${status.n_predicted !== 1 ? "s" : ""} ` +
+    `generated for "${status.response_var || status.response}".\n` +
+    `Switch to the Results tab to view and download them.`
+  );
+
+  // Set up download buttons
+  const serverBase = DeepDiveLLM.LOCAL_SERVER_URL;
+  const predUrl    = `${serverBase}/download/${ts}/predictions.csv`;
+  const modelUrl   = `${serverBase}/download/${ts}/model.pt`;
+
+  const predBtn  = document.getElementById("download-predictions-btn");
+  const modelBtn = document.getElementById("download-model-btn");
+
+  predBtn.href = predUrl;
+
+  if (status.model_url) {
+    modelBtn.href          = modelUrl;
+    modelBtn.style.display = "inline-block";
+  }
+
+  // Update results info bar
+  document.getElementById("results-info").textContent =
+    `${status.n_predicted} predicted rows  •  Response: ${status.response_var || status.response}`;
+
+  // Fetch and render the predictions CSV
+  try {
+    const res  = await fetch(predUrl);
+    const text = await res.text();
+    renderPredictionsTable(text, status.response_var || status.response);
+  } catch (e) {
+    document.getElementById("results-table-wrap").style.display = "block";
+    document.getElementById("results-table-wrap").innerHTML =
+      `<p style="color:var(--text-dim);padding:20px">Could not fetch predictions from local server.<br>Use the Download button above.</p>`;
+  }
+
+  // Show toolbar + table
+  document.getElementById("results-toolbar").style.display    = "flex";
+  document.getElementById("results-table-wrap").style.display = "block";
+
+  toast("Predictions ready! See the Results tab.", "ok");
+  switchTab("results");
+}
+
+/** Handle analysis error. */
+function onAnalysisError(status) {
+  hideResultsLoading();
+  document.getElementById("results-placeholder").style.display = "flex";
+  document.getElementById("results-placeholder").innerHTML = `
+    <div class="results-empty-icon">⚠</div>
+    <div style="color:var(--red)">Analysis failed</div>
+    <div style="font-size:11px;color:var(--text-dim);max-width:280px">
+      ${status.error_msg || "Unknown error. Check the local server logs."}
+    </div>
+  `;
+  appendChatBubble("assistant",
+    `⚠ The analysis ran into an error: ${status.error_msg || "unknown error"}.\n` +
+    `Check that local_server.py and analyze.py are both present and try again.`
+  );
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Predictions table rendering
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Parse a CSV string and render it as a styled HTML table.
+ * The predicted column (prefixed with "predicted_") gets amber highlighting.
+ *
+ * @param {string} csvText      — raw CSV text from predictions.csv
+ * @param {string} responseVar  — the response variable name (for column highlighting)
+ */
+function renderPredictionsTable(csvText, responseVar) {
+  const lines = csvText.trim().split(/\r?\n/).filter(Boolean);
+  if (lines.length < 2) {
+    document.getElementById("results-table-wrap").innerHTML =
+      `<p style="color:var(--text-dim);padding:20px">No predictions to display.</p>`;
+    return;
+  }
+
+  // Parse header row
+  const headers = _parseCSVLine(lines[0]);
+  const predCol = `predicted_${responseVar}`;
+
+  // Build header row
+  const thead = document.getElementById("results-table-head");
+  thead.innerHTML = "<tr>" + headers.map(h =>
+    `<th class="${h === predCol ? "pred-col" : ""}">${h}</th>`
+  ).join("") + "</tr>";
+
+  // Build body rows (cap at 500 for performance)
+  const tbody    = document.getElementById("results-table-body");
+  const maxRows  = Math.min(lines.length - 1, 500);
+  const rows     = [];
+
+  for (let i = 1; i <= maxRows; i++) {
+    const cells = _parseCSVLine(lines[i]);
+    rows.push("<tr>" + cells.map((c, ci) =>
+      `<td class="${headers[ci] === predCol ? "pred-val" : ""}">${c}</td>`
+    ).join("") + "</tr>");
+  }
+
+  tbody.innerHTML = rows.join("");
+
+  if (lines.length - 1 > 500) {
+    const note = document.createElement("p");
+    note.style.cssText = "color:var(--text-dim);font-size:11px;padding:8px 12px";
+    note.textContent   = `Showing 500 of ${lines.length - 1} rows. Download the CSV for the full dataset.`;
+    document.getElementById("results-table-wrap").appendChild(note);
+  }
+}
+
+/** Parse a single CSV line respecting quoted fields. */
+function _parseCSVLine(line) {
+  const result = [];
+  let current  = "";
+  let inQuotes = false;
+  for (const ch of line) {
+    if (ch === '"') { inQuotes = !inQuotes; }
+    else if (ch === "," && !inQuotes) { result.push(current.trim()); current = ""; }
+    else { current += ch; }
+  }
+  result.push(current.trim());
+  return result;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Updated processUploadedFile — keep raw file + trigger server upload
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Override the existing processUploadedFile to also store the raw file
+// and trigger server upload once the response variable is known.
+const _originalProcessUploadedFile = processUploadedFile;
+
+// Redefine to add file storage and auto-trigger
+window.processUploadedFile = async function(file) {
+  // Store the raw file for later server upload
+  _uploadedFile = file;
+
+  // Call the original to parse headers + update chat + sidebar
+  await _originalProcessUploadedFile(file);
+
+  // If a response variable was already identified, send now
+  if (_responseVar) {
+    await sendFileToServer(_responseVar);
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Override _detectResponseVar to trigger server upload when outcome is found
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Wrap sendChatMessage to intercept response variable detection and trigger upload
+const _origSendChat = sendChatMessage;
+
+// Patch the response-variable detection to also trigger the server upload
+const _origOfferLitSearch = _offerLiteratureSearch;
+window._offerLiteratureSearch = function(responseVar) {
+  _responseVar = responseVar;
+  _origOfferLitSearch(responseVar);
+
+  // If we have the file ready, send it to the server now
+  if (_uploadedFile && !_analysisTimestamp) {
+    // Small delay so the literature offer bubble appears first
+    setTimeout(() => sendFileToServer(responseVar), 800);
+  }
+};
+
+
 
 function setStatus(msg) {
   const el = document.getElementById("status-msg");
@@ -1535,8 +1831,7 @@ function setStatus(msg) {
 
 function toast(msg, type = "info") {
   const el = document.createElement("div");
-  el.className   = `toast ${type}`;
-  el.textContent = msg;
+  el.className = `toast ${type}`; el.textContent = msg;
   document.getElementById("toast-container").appendChild(el);
   setTimeout(() => el.remove(), 3500);
 }
