@@ -348,83 +348,180 @@ async function _callLLM(messages, systemPrompt) {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Layout helper — spread nodes across the canvas regardless of LLM coordinates
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Assign good canvas coordinates to every node in the graph.
+ * Called whenever the LLM returns all-zero or all-same coordinates.
+ *
+ * Uses a simple layered layout:
+ *   - Compute each node's "layer" = longest path from any root
+ *   - Spread layers top (roots) to bottom (leaves)
+ *   - Within each layer, spread nodes evenly across the horizontal axis
+ *
+ * Canvas assumptions: ~820px wide × 520px tall (matches the CSS flex layout).
+ *
+ * @param {object} graph  - the parsed graph object (mutated in place)
+ */
+function _spreadNodes(graph) {
+  const nodes = graph.nodes || [];
+  const edges = graph.edges || [];
+  if (nodes.length === 0) return;
+
+  const CANVAS_W = 820;
+  const CANVAS_H = 520;
+  const PAD_X    = 80;    // horizontal padding from edge
+  const PAD_Y    = 70;    // vertical padding from edge
+
+  // Build children map for topological ordering
+  const children = {};
+  const inDeg    = {};
+  for (const n of nodes) { children[n.id] = []; inDeg[n.id] = 0; }
+  for (const [src, tgt] of edges) {
+    children[src].push(tgt);
+    inDeg[tgt]++;
+  }
+
+  // Kahn's topological sort to get layer depths (longest-path ranking)
+  const layer = {};
+  for (const n of nodes) layer[n.id] = 0;
+  const queue = nodes.filter(n => inDeg[n.id] === 0).map(n => n.id);
+  const visited = [];
+  const inDegCopy = { ...inDeg };
+  while (queue.length) {
+    const id = queue.shift();
+    visited.push(id);
+    for (const child of (children[id] || [])) {
+      layer[child] = Math.max(layer[child], layer[id] + 1);
+      if (--inDegCopy[child] === 0) queue.push(child);
+    }
+  }
+  // If there's a cycle (shouldn't happen but guard anyway), assign remaining nodes to layer 0
+  for (const n of nodes) { if (layer[n.id] === undefined) layer[n.id] = 0; }
+
+  // Group nodes by layer
+  const byLayer = {};
+  for (const n of nodes) {
+    const l = layer[n.id];
+    if (!byLayer[l]) byLayer[l] = [];
+    byLayer[l].push(n.id);
+  }
+  const layerNums = Object.keys(byLayer).map(Number).sort((a, b) => a - b);
+  const numLayers = layerNums.length;
+
+  // Assign pixel coordinates
+  for (const l of layerNums) {
+    const nodesInLayer = byLayer[l];
+    const numInLayer   = nodesInLayer.length;
+    const y = numLayers === 1
+      ? CANVAS_H / 2
+      : PAD_Y + (l / (numLayers - 1)) * (CANVAS_H - 2 * PAD_Y);
+
+    nodesInLayer.forEach((id, i) => {
+      const x = numInLayer === 1
+        ? CANVAS_W / 2
+        : PAD_X + (i / (numInLayer - 1)) * (CANVAS_W - 2 * PAD_X);
+      const node = nodes.find(n => n.id === id);
+      if (node) {
+        node.x = Math.round(x);
+        node.y = Math.round(y);
+      }
+    });
+  }
+}
+
+/**
+ * Returns true if all nodes have x=0 and y=0 (LLM ignored coordinates).
+ */
+function _allZeroCoords(graph) {
+  return (graph.nodes || []).every(n => (n.x === 0 || !n.x) && (n.y === 0 || !n.y));
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // DAG JSON extraction
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Scan an LLM reply for the DEEPDIVE_DAG_JSON: marker.
- * Returns { graph, cleanText } where cleanText is the prose without the JSON line.
+ * Scan an LLM reply for the DEEPDIVE_DAG_JSON: marker, parse and repair the graph.
  *
- * Handles two common LLM formatting failures:
- *   1. JSON wrapped in ```json ... ``` fences
- *   2. Whitespace between the marker and the JSON
+ * Repairs applied automatically:
+ *   - Strips markdown code fences the LLM adds despite being told not to
+ *   - Recomputes root_ids, leaf_ids, and parents map from the edges array
+ *   - Fills in missing var_types
+ *   - Spreads node coordinates if the LLM returned all-zero positions
+ *
+ * Returns { graph: null, cleanText } if no valid graph is found.
+ * NOTE: unlike the previous version, we NO LONGER reject graphs with empty
+ * edges here — rejection + retry is handled by the caller (onboardingTurn).
  */
 function extractDAGFromReply(replyText) {
   const MARKER = "DEEPDIVE_DAG_JSON:";
 
-  // Strip markdown code fences the LLM may have added around the whole reply
+  // Strip markdown fences if the LLM wrapped the whole reply
   let text = replyText.trim();
-  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (fenceMatch) {
-    // If fenced JSON contains the marker, unwrap it
-    if (fenceMatch[1].includes(MARKER)) {
-      text = fenceMatch[1].trim();
-    }
+  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/s);
+  if (fenceMatch && fenceMatch[1].includes(MARKER)) {
+    text = fenceMatch[1].trim();
   }
 
   const idx = text.indexOf(MARKER);
   if (idx === -1) return { graph: null, cleanText: replyText };
 
-  // The JSON is everything after the marker, up to the first newline
+  // JSON runs from after the marker to the first newline
   const afterMarker = text.slice(idx + MARKER.length).trim();
   const jsonStr     = afterMarker.split("\n")[0].trim();
   const cleanText   = text.slice(0, idx).trim();
 
+  let graph;
   try {
-    const graph = JSON.parse(jsonStr);
-
-    // ── Post-parse validation and repair ──────────────────────────────────
-    // Guard against the LLM returning nodes with no edges
-    if (!graph.edges || graph.edges.length === 0) {
-      console.warn("LLM returned a DAG with no edges — graph rejected.");
-      return { graph: null, cleanText: replyText };
-    }
-
-    // Ensure parents map exists and is consistent with edges
-    if (!graph.parents) graph.parents = {};
-    const nodeIds = (graph.nodes || []).map(n => String(n.id));
-    for (const id of nodeIds) {
-      if (!graph.parents[id]) graph.parents[id] = [];
-    }
-    for (const [src, tgt] of (graph.edges || [])) {
-      const tgtStr = String(tgt);
-      if (!graph.parents[tgtStr]) graph.parents[tgtStr] = [];
-      if (!graph.parents[tgtStr].includes(src)) {
-        graph.parents[tgtStr].push(src);
-      }
-    }
-
-    // Recompute root_ids and leaf_ids from edges (LLM sometimes gets these wrong)
-    const hasParent = new Set((graph.edges || []).map(([, t]) => t));
-    const hasChild  = new Set((graph.edges || []).map(([s]) => s));
-    const allIds    = (graph.nodes || []).map(n => n.id);
-    graph.root_ids  = allIds.filter(id => !hasParent.has(id));
-    graph.leaf_ids  = allIds.filter(id => !hasChild.has(id));
-
-    // Ensure var_types map exists
-    if (!graph.var_types) graph.var_types = {};
-    for (const node of (graph.nodes || [])) {
-      if (!graph.var_types[String(node.id)]) {
-        graph.var_types[String(node.id)] = node.var_type || "continuous";
-      }
-    }
-
-    return { graph, cleanText };
-
+    graph = JSON.parse(jsonStr);
   } catch (e) {
     console.error("DAG JSON parse failed:", jsonStr, e);
     return { graph: null, cleanText: replyText };
   }
+
+  if (!graph.nodes || graph.nodes.length === 0) {
+    return { graph: null, cleanText: replyText };
+  }
+
+  // ── Repair: ensure edges array exists ──────────────────────────────────────
+  if (!graph.edges) graph.edges = [];
+
+  // ── Repair: recompute root_ids, leaf_ids, parents from edges ───────────────
+  // (LLM frequently gets these wrong even when edges are correct)
+  const allIds    = graph.nodes.map(n => n.id);
+  const hasParent = new Set(graph.edges.map(([, t]) => t));
+  const hasChild  = new Set(graph.edges.map(([s]) => s));
+  graph.root_ids  = allIds.filter(id => !hasParent.has(id));
+  graph.leaf_ids  = allIds.filter(id => !hasChild.has(id));
+
+  graph.parents = {};
+  for (const id of allIds) graph.parents[String(id)] = [];
+  for (const [src, tgt] of graph.edges) {
+    const k = String(tgt);
+    if (!graph.parents[k]) graph.parents[k] = [];
+    if (!graph.parents[k].includes(src)) graph.parents[k].push(src);
+  }
+
+  // ── Repair: fill missing var_types ─────────────────────────────────────────
+  if (!graph.var_types) graph.var_types = {};
+  for (const node of graph.nodes) {
+    if (!graph.var_types[String(node.id)]) {
+      graph.var_types[String(node.id)] = node.var_type || "continuous";
+    }
+  }
+
+  // ── Repair: spread coordinates if LLM ignored the layout instructions ──────
+  // This is the primary fix for "all nodes in top-left corner"
+  if (_allZeroCoords(graph)) {
+    _spreadNodes(graph);
+  }
+
+  if (!graph.levels) graph.levels = {};
+
+  return { graph, cleanText };
 }
 
 
@@ -452,8 +549,36 @@ async function onboardingTurn(history, userMessage) {
   }
 
   const { graph, cleanText } = extractDAGFromReply(raw);
-  history.push({ role: "assistant", content: cleanText || raw });
 
+  // ── Auto-retry if the LLM produced nodes but forgot edges ──────────────────
+  // This is the primary fix for "DAG has no edges".
+  // We inject a correction into the history and call the LLM one more time.
+  if (graph && graph.edges.length === 0 && graph.nodes.length > 0) {
+    console.warn("LLM returned no edges — sending correction and retrying.");
+
+    // Add the bad response to history so the LLM has context
+    history.push({ role: "assistant", content: cleanText || raw });
+
+    const correction =
+      "Your DAG JSON had no edges — every node was disconnected. " +
+      "Please regenerate the DEEPDIVE_DAG_JSON with edges connecting the nodes " +
+      "based on the causal relationships we discussed. " +
+      "The edges array must not be empty.";
+
+    history.push({ role: "user", content: correction });
+
+    const raw2 = await _callLLM(history, ONBOARDING_SYSTEM_PROMPT);
+    if (raw2) {
+      const retry = extractDAGFromReply(raw2);
+      // Apply layout if still all-zero after retry
+      if (retry.graph && _allZeroCoords(retry.graph)) _spreadNodes(retry.graph);
+      history.push({ role: "assistant", content: retry.cleanText || raw2 });
+      return { reply: retry.cleanText || raw2, graph: retry.graph };
+    }
+  }
+
+  // Normal path — graph is fine (or null, meaning no JSON in this turn yet)
+  history.push({ role: "assistant", content: cleanText || raw });
   return { reply: cleanText || raw, graph };
 }
 
@@ -481,8 +606,27 @@ async function chatTurn(history, userMessage) {
   }
 
   const { graph, cleanText } = extractDAGFromReply(raw);
-  history.push({ role: "assistant", content: cleanText || raw });
 
+  // Auto-retry if the LLM produced a DAG with no edges
+  if (graph && graph.edges.length === 0 && graph.nodes.length > 0) {
+    console.warn("Chat LLM returned no edges — retrying with correction.");
+    history.push({ role: "assistant", content: cleanText || raw });
+    history.push({
+      role: "user",
+      content:
+        "Your DAG had no edges. Please regenerate it with edges connecting the nodes. " +
+        "The edges array must not be empty.",
+    });
+    const raw2 = await _callLLM(history, CHAT_SYSTEM_PROMPT);
+    if (raw2) {
+      const retry = extractDAGFromReply(raw2);
+      if (retry.graph && _allZeroCoords(retry.graph)) _spreadNodes(retry.graph);
+      history.push({ role: "assistant", content: retry.cleanText || raw2 });
+      return { reply: retry.cleanText || raw2, graph: retry.graph };
+    }
+  }
+
+  history.push({ role: "assistant", content: cleanText || raw });
   return { reply: cleanText || raw, graph };
 }
 
